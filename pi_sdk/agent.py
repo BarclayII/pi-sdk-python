@@ -19,6 +19,7 @@ from pi_sdk.agent_types import (
     TurnStart,
 )
 from pi_sdk.llm_client import LLMClient, StreamEvent
+from pi_sdk.skills import load_skills
 from pi_sdk.tools.base import Tool
 from pi_sdk.types import (
     AssistantMessage,
@@ -37,11 +38,16 @@ class AgentConfig:
     system_prompt: str
     tools: list[Tool] = None
     max_turns: int = 50
+    skills_dir: str | None = None
     on_event: Callable[[AgentEvent], None] | None = None
 
     def __post_init__(self):
         if self.tools is None:
             self.tools = []
+        if self.skills_dir:
+            skills_xml = load_skills(self.skills_dir)
+            if skills_xml:
+                self.system_prompt = self.system_prompt + "\n\n" + skills_xml
 
 
 async def agent_loop(

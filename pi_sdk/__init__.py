@@ -33,6 +33,9 @@ from pi_sdk.agent_types import (
     TurnStart,
 )
 
+# Public API - Skills
+from pi_sdk.skills import load_skills
+
 # Public API - Tools
 from pi_sdk.tools import create_coding_tools
 from pi_sdk.tools.base import Tool, ToolParameter, ToolResult, ToolSchema
@@ -65,6 +68,8 @@ __all__ = [
     "TextDelta",
     "ToolExecStart",
     "ToolExecEnd",
+    # Skills
+    "load_skills",
     # Tools
     "Tool",
     "ToolParameter",
