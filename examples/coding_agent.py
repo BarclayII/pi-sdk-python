@@ -76,6 +76,7 @@ async def main():
         system_prompt=os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
         tools=tools,
         max_turns=50,
+        skills_dir="./example_skills"
     )
 
     # Conversation history for multi-round support
