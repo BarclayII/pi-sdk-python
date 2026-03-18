@@ -10,7 +10,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Literal, Union
 
+import httpx
 import litellm
+
+AIHUBMIX_API_BASE = "https://aihubmix.com/api/v1"
 
 from pi_sdk.agent_types import TextDelta
 from pi_sdk.types import (
@@ -40,9 +43,35 @@ class LLMClient:
 
     model: str  # e.g. "anthropic/claude-sonnet-4-20250514"
     api_key: str | None = None
-    api_base: str | None = None
+    api_base: str = AIHUBMIX_API_BASE
     max_tokens: int = 8192
     temperature: float | None = None
+
+    async def get_context_window(self) -> int:
+        """Query the aihubmix /models endpoint for this model's context window.
+
+        Returns:
+            context_length for the model
+
+        Raises:
+            RuntimeError: if the request fails or the response is unexpected
+        """
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.api_base}/models",
+                params={"model": self.model},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to fetch model info: HTTP {response.status_code}"
+            )
+        data = response.json()
+        if not data.get("success"):
+            raise RuntimeError("Model info request returned success=false")
+        if not data.get("data"):
+            raise RuntimeError(f"No model data returned for model '{self.model}'")
+        return data["data"][0]["context_length"]
 
     async def stream(
         self,

@@ -5,16 +5,18 @@ This example demonstrates how to use pi-sdk-python to create a coding agent
 that can read files, execute commands, and make edits.
 """
 
+import argparse
 import asyncio
 import os
 from dotenv import load_dotenv
+from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
 
 from pi_sdk import (
-    AgentConfig,
+    Agent,
     LLMClient,
     ToolExecStart,
     TextDelta,
-    agent_loop,
 )
 from pi_sdk.tools import create_coding_tools
 
@@ -45,52 +47,91 @@ Important guidelines:
 Your responses should be concise and focused on solving the user's problem."""
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="PI SDK Python - Coding Agent")
+    parser.add_argument(
+        "--model",
+        default="openai/claude-sonnet-4-5",
+        help="Model to use (default: openai/claude-sonnet-4-5)",
+    )
+    parser.add_argument(
+        "--cwd", default=".", help="Working directory for tools (default: .)"
+    )
+    parser.add_argument(
+        "--system-prompt",
+        metavar="PATH",
+        help="Path to a markdown file to use as the system prompt",
+    )
+    parser.add_argument("--skills-dir", metavar="PATH", help="Path to skills directory")
+    parser.add_argument(
+        "--max-turns", type=int, default=50, help="Maximum agent turns (default: 50)"
+    )
+    return parser.parse_args()
+
+
 async def main():
     """Run the coding agent example."""
-    # Get configuration from environment
-    model = os.getenv("MODEL", "claude-sonnet-4-5")
+    args = parse_args()
+
+    # Get API credentials from environment
     api_key = os.getenv("API_KEY")
     api_base = os.getenv("API_BASE")
-    cwd = os.getenv("CWD", ".")
 
-    # Validate configuration
     if not api_key:
         print("Error: API_KEY environment variable is required")
         print("Set it in your .env file or export it:")
         print("  export API_KEY=your_api_key_here")
         return
 
+    # Load system prompt from file if provided
+    if args.system_prompt:
+        with open(args.system_prompt) as f:
+            system_prompt = f.read()
+    else:
+        system_prompt = DEFAULT_SYSTEM_PROMPT
+
     # Create the LLM client
     client = LLMClient(
-        model=model,
+        model=args.model,
         api_key=api_key,
         api_base=api_base,
     )
 
     # Create coding tools
-    tools = create_coding_tools(cwd=cwd)
+    tools = create_coding_tools(cwd=args.cwd)
 
     # Configure the agent
-    config = AgentConfig(
+    agent = Agent(
         llm=client,
-        system_prompt=os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
+        system_prompt=system_prompt,
         tools=tools,
-        max_turns=50,
-        skills_dir="./example_skills"
+        max_turns=args.max_turns,
+        skills_dir=args.skills_dir,
     )
 
-    # Conversation history for multi-round support
-    messages = []
+    # Set up prompt_toolkit for multi-line editing with cursor navigation
+    # Enter submits; Esc+Enter or Alt+Enter inserts a newline
+    bindings = KeyBindings()
+
+    @bindings.add("escape", "enter")
+    def _(event):
+        event.current_buffer.insert_text("\n")
+
+    session = PromptSession(
+        multiline=False,
+        key_bindings=bindings,
+    )
 
     # Get user input
     print("=" * 60)
     print("PI SDK Python - Coding Agent")
     print("=" * 60)
-    print("\nEnter your request (or 'quit' to exit):\n")
+    print("\nEnter your request (or 'quit' to exit).")
+    print("Press Enter to submit, Esc+Enter for a new line.\n")
 
     while True:
         try:
-            user_input = input("> ").strip()
+            user_input = (await session.prompt_async("> ")).strip()
 
             if not user_input:
                 continue
@@ -101,7 +142,7 @@ async def main():
 
             # Run the agent loop
             print()
-            async for event in agent_loop(user_input, config, messages):
+            async for event in agent.run(user_input):
                 if isinstance(event, TextDelta):
                     print(event.delta, end="", flush=True)
                 elif isinstance(event, ToolExecStart):

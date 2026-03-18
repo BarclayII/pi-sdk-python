@@ -9,7 +9,7 @@ import asyncio
 import os
 from dotenv import load_dotenv
 
-from pi_sdk import AgentConfig, LLMClient, TextDelta, agent_loop
+from pi_sdk import Agent, LLMClient, TextDelta
 
 # Load environment variables
 load_dotenv()
@@ -37,14 +37,11 @@ async def main():
     )
 
     # Configure the agent (no tools)
-    config = AgentConfig(
+    agent = Agent(
         llm=client,
         system_prompt="You are a helpful assistant. Be concise and friendly.",
         tools=[],  # No tools for simple chat
     )
-
-    # Conversation history for multi-round support
-    messages = []
 
     # Get user input
     print("=" * 60)
@@ -65,7 +62,7 @@ async def main():
 
             # Run the agent loop
             print()
-            async for event in agent_loop(user_input, config, messages):
+            async for event in agent.run(user_input):
                 if isinstance(event, TextDelta):
                     print(event.delta, end="", flush=True)
 

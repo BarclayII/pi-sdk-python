@@ -1,11 +1,11 @@
 """
-Agent loop for pi-sdk-python.
+Agent module for pi-sdk-python.
 
-This module provides the core agent loop that manages conversations with the LLM.
+This module provides the stateful Agent class that manages conversations with the LLM.
 """
 
-from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Callable, Union
+import json
+from typing import AsyncGenerator, Callable
 
 from pi_sdk.agent_types import (
     AgentEnd,
@@ -14,7 +14,6 @@ from pi_sdk.agent_types import (
     TextDelta,
     ToolExecEnd,
     ToolExecStart,
-    ToolResultData,
     TurnEnd,
     TurnStart,
 )
@@ -24,173 +23,139 @@ from pi_sdk.tools.base import Tool
 from pi_sdk.types import (
     AssistantMessage,
     Message,
+    TextContent,
     ToolCallContent,
     ToolResultMessage,
     UserMessage,
 )
 
 
-@dataclass
-class AgentConfig:
-    """Configuration for the agent loop."""
+class Agent:
+    """Stateful agent that holds messages and config, making multi-round conversations natural."""
 
-    llm: LLMClient
-    system_prompt: str
-    tools: list[Tool] = None
-    max_turns: int = 50
-    skills_dir: str | None = None
-    on_event: Callable[[AgentEvent], None] | None = None
+    def __init__(
+        self,
+        llm: LLMClient,
+        system_prompt: str,
+        tools: list[Tool] | None = None,
+        max_turns: int = 50,
+        skills_dir: str | None = None,
+        on_event: Callable[[AgentEvent], None] | None = None,
+    ):
+        self.llm = llm
+        self.system_prompt = system_prompt
+        self.tools = tools or []
+        self.max_turns = max_turns
+        self.on_event = on_event
+        self.messages: list[Message] = []
 
-    def __post_init__(self):
-        if self.tools is None:
-            self.tools = []
-        if self.skills_dir:
-            skills_xml = load_skills(self.skills_dir)
+        if skills_dir:
+            skills_xml = load_skills(skills_dir)
             if skills_xml:
-                self.system_prompt = self.system_prompt + "\n\n" + skills_xml
+                self.system_prompt += "\n\n" + skills_xml
 
+    async def run(self, user_input: str) -> AsyncGenerator[AgentEvent, None]:
+        """Run the agent loop for a single user input.
 
-async def agent_loop(
-    user_input: str,
-    config: AgentConfig,
-    messages: list[Message] | None = None,
-) -> AsyncGenerator[AgentEvent, None]:
-    """Run the agent loop.
+        Appends the user message and all subsequent assistant/tool messages
+        to self.messages, so the caller can issue multiple run() calls for
+        multi-round conversations.
 
-    Args:
-        user_input: Initial user input
-        config: Agent configuration
-        messages: Optional message history for multi-round conversations.
-            When provided, the list is mutated in place — new messages are
-            appended so the caller can reuse it across calls.
+        Yields:
+            AgentEvent instances for each step of the agent loop.
+        """
+        yield AgentStart()
 
-    Yields:
-        AgentEvent instances for each step of the agent loop
-    """
-    yield AgentStart()
+        self.messages.append(UserMessage(content=user_input))
 
-    if messages is None:
-        messages = []
-    messages.append(UserMessage(content=user_input))
+        for turn in range(self.max_turns):
+            yield TurnStart(turn=turn)
 
-    for turn in range(config.max_turns):
-        yield TurnStart(turn=turn)
+            # Stream LLM response
+            assistant_message: AssistantMessage | None = None
+            async for event in self.llm.stream(
+                self.messages, self.tools, self.system_prompt
+            ):
+                if isinstance(event.event, TextDelta):
+                    yield TextDelta(delta=event.event.delta)
+                elif isinstance(event.event, AssistantMessage):
+                    assistant_message = event.event
 
-        # Stream LLM response
-        assistant_message: AssistantMessage | None = None
-        async for event in config.llm.stream(
-            messages, config.tools, config.system_prompt
-        ):
-            if isinstance(event.event, TextDelta):
-                yield TextDelta(delta=event.event.delta)
-            elif isinstance(event.event, AssistantMessage):
-                assistant_message = event.event
+            if assistant_message is None:
+                assistant_message = AssistantMessage(
+                    role="assistant", content=[], model="", stop_reason=""
+                )
 
-        if assistant_message is None:
-            # This shouldn't happen, but handle gracefully
-            assistant_message = AssistantMessage(
-                role="assistant", content=[], model="", stop_reason=""
-            )
+            self.messages.append(assistant_message)
 
-        messages.append(assistant_message)
+            # Extract tool calls
+            tool_calls = [
+                block
+                for block in assistant_message.content
+                if isinstance(block, ToolCallContent)
+            ]
 
-        # Extract tool calls
-        tool_calls = [
-            block
-            for block in assistant_message.content
-            if isinstance(block, ToolCallContent)
-        ]
+            if not tool_calls:
+                yield TurnEnd(turn=turn)
+                break
 
-        if not tool_calls:
-            # No more tool calls, we're done
-            yield TurnEnd(turn=turn)
-            break
-
-        # Execute tool calls
-        for tool_call in tool_calls:
-            yield ToolExecStart(
-                tool_call_id=tool_call.id,
-                name=tool_call.name,
-                arguments=tool_call.arguments,
-            )
-
-            # Find the tool
-            tool = None
-            for t in config.tools:
-                if t.name == tool_call.name:
-                    tool = t
-                    break
-
-            if tool is None:
-                result = ToolResultData(
+            # Execute tool calls
+            for tool_call in tool_calls:
+                yield ToolExecStart(
                     tool_call_id=tool_call.id,
                     name=tool_call.name,
-                    content=f"Error: Tool '{tool_call.name}' not found",
-                    is_error=True,
+                    arguments=tool_call.arguments,
                 )
-            else:
-                try:
-                    tool_result = await tool.execute(tool_call.id, tool_call.arguments)
-                    result = ToolResultData(
+
+                # Find the tool
+                tool = None
+                for t in self.tools:
+                    if t.name == tool_call.name:
+                        tool = t
+                        break
+
+                if tool is None:
+                    result = ToolExecEnd(
                         tool_call_id=tool_call.id,
                         name=tool_call.name,
-                        content=tool_result.content,
-                        is_error=tool_result.is_error,
-                    )
-                except Exception as e:
-                    result = ToolResultData(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        content=f"Error executing tool: {e!s}",
+                        content=f"Error: Tool '{tool_call.name}' not found",
                         is_error=True,
                     )
+                else:
+                    try:
+                        tool_result = await tool.execute(
+                            tool_call.id, tool_call.arguments
+                        )
+                        result = ToolExecEnd(
+                            tool_call_id=tool_call.id,
+                            name=tool_call.name,
+                            content=tool_result.content,
+                            is_error=tool_result.is_error,
+                        )
+                    except Exception as e:
+                        result = ToolExecEnd(
+                            tool_call_id=tool_call.id,
+                            name=tool_call.name,
+                            content=f"Error executing tool: {e!s}",
+                            is_error=True,
+                        )
 
-            yield ToolExecEnd(
-                tool_call_id=result.tool_call_id,
-                name=result.name,
-                content=result.content,
-                is_error=result.is_error,
-            )
+                yield result
 
-            # Add tool result to messages
-            messages.append(
-                ToolResultMessage(
-                    role="tool_result",
-                    tool_call_id=result.tool_call_id,
-                    tool_name=result.name,
-                    content=result.content,
-                    is_error=result.is_error,
+                # Add tool result to messages
+                self.messages.append(
+                    ToolResultMessage(
+                        tool_call_id=result.tool_call_id,
+                        tool_name=result.name,
+                        content=result.content,
+                        is_error=result.is_error,
+                    )
                 )
-            )
 
-        yield TurnEnd(turn=turn)
+            yield TurnEnd(turn=turn)
 
-    yield AgentEnd(messages=messages)
+        yield AgentEnd(messages=self.messages)
 
-
-async def run_agent(
-    user_input: str,
-    config: AgentConfig,
-    messages: list[Message] | None = None,
-) -> list[Message]:
-    """Run the agent loop and return final messages.
-
-    Args:
-        user_input: Initial user input
-        config: Agent configuration
-        messages: Optional message history for multi-round conversations.
-            When provided, the list is mutated in place.
-
-    Returns:
-        List of all messages from the conversation
-    """
-    final_messages: list[Message] = []
-
-    async for event in agent_loop(user_input, config, messages):
-        if config.on_event:
-            config.on_event(event)
-
-        if isinstance(event, AgentEnd):
-            final_messages = event.messages
-
-    return final_messages
+    def reset(self):
+        """Clear message history."""
+        self.messages = []

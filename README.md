@@ -4,7 +4,7 @@ A minimal, general-purpose Python SDK for building LLM-powered tools and agents.
 
 ## Features
 
-- 🚀 **Simple Agent Loop** - Easy-to-use agent loop with streaming support
+- 🚀 **Stateful Agent** - Easy-to-use Agent class with streaming and multi-turn support
 - 🔧 **Tool Calling** - Built-in support for LLM function/tool calling
 - 🎯 **Multi-Provider** - Works with 100+ LLM providers via LiteLLM
 - 📝 **Coding Tools** - Pre-built tools for file operations and code editing
@@ -57,7 +57,7 @@ See `.env.example` for more options.
 import asyncio
 import os
 from dotenv import load_dotenv
-from pi_sdk import AgentConfig, LLMClient, TextDelta, agent_loop
+from pi_sdk import Agent, LLMClient, TextDelta
 
 load_dotenv()
 
@@ -68,15 +68,15 @@ async def main():
         api_key=os.getenv("API_KEY"),
     )
 
-    # Configure agent
-    config = AgentConfig(
+    # Create agent
+    agent = Agent(
         llm=client,
         system_prompt="You are a helpful assistant.",
         tools=[],  # No tools for simple chat
     )
 
-    # Run agent loop
-    async for event in agent_loop("Hello! What can you help me with?", config):
+    # Run agent
+    async for event in agent.run("Hello! What can you help me with?"):
         if isinstance(event, TextDelta):
             print(event.delta, end="", flush=True)
 
@@ -92,7 +92,7 @@ Build an agent with file operations and command execution:
 import asyncio
 import os
 from dotenv import load_dotenv
-from pi_sdk import AgentConfig, LLMClient, TextDelta, ToolExecStart, agent_loop
+from pi_sdk import Agent, LLMClient, TextDelta, ToolExecStart
 from pi_sdk.tools import create_coding_tools
 
 load_dotenv()
@@ -107,8 +107,8 @@ async def main():
     # Create coding tools (read, write, edit, bash)
     tools = create_coding_tools(cwd=".")
 
-    # Configure agent
-    config = AgentConfig(
+    # Create agent
+    agent = Agent(
         llm=client,
         system_prompt="You are an expert coding assistant.",
         tools=tools,
@@ -116,7 +116,7 @@ async def main():
     )
 
     # Run agent with tool support
-    async for event in agent_loop("Create a hello.py file", config):
+    async for event in agent.run("Create a hello.py file"):
         if isinstance(event, TextDelta):
             print(event.delta, end="", flush=True)
         elif isinstance(event, ToolExecStart):
@@ -128,12 +128,12 @@ if __name__ == "__main__":
 
 ## Core Concepts
 
-### Agent Loop
+### Agent
 
-The agent loop manages the conversation flow between the user, LLM, and tools:
+The `Agent` class manages the conversation flow between the user, LLM, and tools:
 
 ```python
-async for event in agent_loop(user_input, config, messages):
+async for event in agent.run(user_input):
     match event:
         case AgentStart():
             print("Agent started")
@@ -238,7 +238,7 @@ from pi_sdk.tools.base import Tool, ToolSchema, ToolParameter, ToolResult
 @dataclass
 class MyTool:
     """Custom tool implementation."""
-    
+
     name: str = "my_tool"
     description: str = "Description of what this tool does"
     schema: ToolSchema = ToolSchema(
@@ -251,7 +251,7 @@ class MyTool:
             ),
         ]
     )
-    
+
     async def execute(self, tool_call_id: str, args: dict) -> ToolResult:
         """Execute the tool."""
         try:
@@ -263,24 +263,25 @@ class MyTool:
 
 ### Multi-Turn Conversations
 
-Maintain conversation history across multiple turns:
+The `Agent` maintains conversation history automatically across calls:
 
 ```python
-# Initialize message history
-messages = []
+agent = Agent(llm=client, system_prompt="...", tools=tools)
 
 # First turn
-async for event in agent_loop("What files are in this directory?", config, messages):
-    # messages list is updated in-place
+async for event in agent.run("What files are in this directory?"):
     pass
 
 # Second turn - uses history from first turn
-async for event in agent_loop("Read the first file", config, messages):
+async for event in agent.run("Read the first file"):
     pass
 
 # Third turn - full context preserved
-async for event in agent_loop("Edit line 5 of that file", config, messages):
+async for event in agent.run("Edit line 5 of that file"):
     pass
+
+# Reset history if needed
+agent.reset()
 ```
 
 ### Event Handling
@@ -288,13 +289,13 @@ async for event in agent_loop("Edit line 5 of that file", config, messages):
 Subscribe to agent events for logging, monitoring, or UI updates:
 
 ```python
-from pi_sdk import AgentConfig, AgentEvent
+from pi_sdk import Agent, AgentEvent
 
 def on_event(event: AgentEvent):
     """Handle agent events."""
     print(f"Event: {type(event).__name__}")
 
-config = AgentConfig(
+agent = Agent(
     llm=client,
     system_prompt="...",
     tools=tools,
@@ -318,28 +319,23 @@ LLMClient(
 )
 ```
 
-#### `AgentConfig`
+#### `Agent`
 
 ```python
-AgentConfig(
+Agent(
     llm: LLMClient,                           # LLM client instance
     system_prompt: str,                       # System prompt for the agent
     tools: list[Tool] = [],                   # List of available tools
     max_turns: int = 50,                      # Maximum conversation turns
+    skills_dir: str | None = None,            # Optional skills directory
     on_event: Callable[[AgentEvent], None] | None = None,  # Event callback
 )
 ```
 
-#### `agent_loop()`
+**Methods:**
 
-```python
-async def agent_loop(
-    user_input: str,                  # User's input message
-    config: AgentConfig,              # Agent configuration
-    messages: list[Message] | None = None,  # Optional message history (mutated in-place)
-) -> AsyncGenerator[AgentEvent, None]:
-    """Run the agent loop and yield events."""
-```
+- `async run(user_input: str) -> AsyncGenerator[AgentEvent, None]` — Run the agent for a user input, yielding events.
+- `reset()` — Clear message history.
 
 ### Events
 
@@ -389,20 +385,24 @@ Agent with file operations and command execution.
 Via LiteLLM, supports 100+ models including:
 
 ### Anthropic
+
 - `anthropic/claude-sonnet-4-20250514`
 - `anthropic/claude-3-5-sonnet-20241022`
 - `anthropic/claude-3-opus-20240229`
 
 ### OpenAI
+
 - `openai/gpt-4o`
 - `openai/gpt-4o-mini`
 - `openai/gpt-4-turbo`
 
 ### Google
+
 - `google/gemini-2.0-flash-exp`
 - `google/gemini-1.5-pro`
 
 ### Others
+
 - Azure OpenAI
 - Ollama (local models)
 - Together AI
@@ -429,7 +429,7 @@ CWD=.                       # Working directory for file operations
 ### Python Configuration
 
 ```python
-from pi_sdk import LLMClient, AgentConfig
+from pi_sdk import LLMClient, Agent
 
 # Configure LLM client
 client = LLMClient(
@@ -440,13 +440,12 @@ client = LLMClient(
     temperature=None,        # Sampling temperature (provider default)
 )
 
-# Configure agent
-config = AgentConfig(
+# Create agent
+agent = Agent(
     llm=client,
     system_prompt="Your system prompt here",
     tools=create_coding_tools(cwd="."),
     max_turns=50,            # Maximum conversation turns
-    on_event=None,           # Optional event callback
 )
 ```
 

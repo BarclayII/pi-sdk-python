@@ -21,7 +21,7 @@ from pi_sdk.types import (
 from pi_sdk.llm_client import LLMClient, StreamEvent, TextDelta as ClientTextDelta
 
 # Public API - Agent
-from pi_sdk.agent import AgentConfig, agent_loop, run_agent
+from pi_sdk.agent import Agent
 from pi_sdk.agent_types import (
     AgentEnd,
     AgentEvent,
@@ -57,9 +57,7 @@ __all__ = [
     "LLMClient",
     "StreamEvent",
     # Agent
-    "AgentConfig",
-    "agent_loop",
-    "run_agent",
+    "Agent",
     "AgentEvent",
     "AgentStart",
     "AgentEnd",

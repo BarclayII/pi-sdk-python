@@ -48,7 +48,7 @@ async def test_imports():
         return False
 
     try:
-        from pi_sdk import AgentConfig, agent_loop
+        from pi_sdk import Agent
 
         print("  ✓ Agent imports successfully")
     except Exception as e:
