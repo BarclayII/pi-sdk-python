@@ -5,6 +5,7 @@ This module provides the stateful Agent class that manages conversations with th
 """
 
 import json
+import logging
 from typing import AsyncGenerator, Callable
 
 from pi_sdk.agent_types import (
@@ -26,8 +27,46 @@ from pi_sdk.types import (
     TextContent,
     ToolCallContent,
     ToolResultMessage,
+    Usage,
     UserMessage,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _format_messages_for_compact(messages: list[Message]) -> str:
+    """Format messages into a compact text representation for summarization.
+
+    Converts structured messages into a flat text format:
+      USER: ...
+      ASSISTANT: ...
+      TOOL(name, {args}): content
+    """
+    # Build lookup of tool_call_id -> (name, arguments) from AssistantMessages
+    tool_call_map: dict[str, tuple[str, dict]] = {}
+    for msg in messages:
+        if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, ToolCallContent):
+                    tool_call_map[block.id] = (block.name, block.arguments)
+
+    lines: list[str] = []
+    for msg in messages:
+        if isinstance(msg, UserMessage):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            lines.append(f"USER: {content}")
+        elif isinstance(msg, AssistantMessage):
+            text_parts = [b.text for b in msg.content if isinstance(b, TextContent)]
+            if text_parts:
+                lines.append(f"ASSISTANT: {' '.join(text_parts)}")
+        elif isinstance(msg, ToolResultMessage):
+            _, args = tool_call_map.get(msg.tool_call_id, (msg.tool_name, {}))
+            error_tag = " [ERROR]" if msg.is_error else ""
+            lines.append(
+                f"TOOL({msg.tool_name}, {json.dumps(args)}):{error_tag} {msg.content}"
+            )
+
+    return "\n".join(lines)
 
 
 class Agent:
@@ -41,13 +80,16 @@ class Agent:
         max_turns: int = 50,
         skills_dir: str | None = None,
         on_event: Callable[[AgentEvent], None] | None = None,
+        auto_compact: bool = True,
     ):
         self.llm = llm
         self.system_prompt = system_prompt
         self.tools = tools or []
         self.max_turns = max_turns
         self.on_event = on_event
+        self.auto_compact = auto_compact
         self.messages: list[Message] = []
+        self._context_window: int | None = None
 
         if skills_dir:
             skills_xml = load_skills(skills_dir)
@@ -70,6 +112,9 @@ class Agent:
 
         for turn in range(self.max_turns):
             yield TurnStart(turn=turn)
+
+            # Auto-compact if approaching context limit
+            await self._maybe_compact()
 
             # Stream LLM response
             assistant_message: AssistantMessage | None = None
@@ -155,6 +200,135 @@ class Agent:
             yield TurnEnd(turn=turn)
 
         yield AgentEnd(messages=self.messages)
+
+    def _get_last_usage(self) -> Usage | None:
+        """Find the most recent AssistantMessage's usage info."""
+        for msg in reversed(self.messages):
+            if isinstance(msg, AssistantMessage) and msg.usage:
+                return msg.usage
+        return None
+
+    async def _maybe_compact(self) -> None:
+        """Compact messages if approaching the context window limit."""
+        if not self.auto_compact or len(self.messages) < 4:
+            return
+
+        usage = self._get_last_usage()
+        if usage is None or usage.input_tokens == 0:
+            return
+
+        # Fetch and cache context window size
+        if self._context_window is None:
+            self._context_window = await self.llm.get_context_window()
+
+        threshold = int(self._context_window * 0.80)
+        if usage.input_tokens < threshold:
+            return
+
+        # Keep last 6 messages, but adjust split point to a UserMessage boundary
+        # so we don't leave orphaned ToolResultMessages or AssistantMessages.
+        keep_recent = min(6, len(self.messages))
+        split = len(self.messages) - keep_recent
+        while split < len(self.messages) and not isinstance(
+            self.messages[split], UserMessage
+        ):
+            split += 1
+
+        old_messages = self.messages[:split]
+        recent_messages = self.messages[split:]
+
+        if not old_messages:
+            return
+
+        logger.info(
+            "Compacting %d old messages (input_tokens=%d, threshold=%d)",
+            len(old_messages),
+            usage.input_tokens,
+            threshold,
+        )
+
+        try:
+            summary = await self._summarize(old_messages)
+        except Exception:
+            logger.warning("Summarization failed, skipping compaction", exc_info=True)
+            return
+
+        if not summary:
+            return
+
+        self.messages = [
+            UserMessage(content=f"<context-summary>\n{summary}\n</context-summary>"),
+            *recent_messages,
+        ]
+
+    async def _summarize(self, messages: list[Message]) -> str:
+        """Summarize messages via an LLM call."""
+        formatted = _format_messages_for_compact(messages)
+        summary_messages: list[Message] = [
+            UserMessage(
+                content=(
+                    "Summarize this conversation history concisely. "
+                    "Preserve key decisions, file paths, errors, and outcomes.\n\n"
+                    f"{formatted}"
+                )
+            )
+        ]
+        result = ""
+        async for event in self.llm.stream(
+            summary_messages, tools=None, system_prompt=None
+        ):
+            if isinstance(event.event, AssistantMessage):
+                for block in event.event.content:
+                    if isinstance(block, TextContent):
+                        result += block.text
+        return result
+
+    async def compact(self) -> bool:
+        """Manually compact the conversation history.
+
+        Forces compaction regardless of token usage, summarizing older messages
+        and keeping only the most recent ones.
+
+        Returns:
+            True if compaction was performed, False if there were too few messages.
+        """
+        if len(self.messages) < 4:
+            logger.info("Skipping compact: fewer than 4 messages")
+            return False
+
+        # Keep last 6 messages, adjust split to a UserMessage boundary
+        keep_recent = min(6, len(self.messages))
+        split = len(self.messages) - keep_recent
+        while split < len(self.messages) and not isinstance(
+            self.messages[split], UserMessage
+        ):
+            split += 1
+
+        old_messages = self.messages[:split]
+        recent_messages = self.messages[split:]
+
+        if not old_messages:
+            logger.info("Skipping compact: no old messages to summarize")
+            return False
+
+        logger.info("Manually compacting %d old messages", len(old_messages))
+
+        try:
+            summary = await self._summarize(old_messages)
+        except Exception:
+            logger.warning(
+                "Summarization failed during manual compaction", exc_info=True
+            )
+            return False
+
+        if not summary:
+            return False
+
+        self.messages = [
+            UserMessage(content=f"<context-summary>\n{summary}\n</context-summary>"),
+            *recent_messages,
+        ]
+        return True
 
     def reset(self):
         """Clear message history."""

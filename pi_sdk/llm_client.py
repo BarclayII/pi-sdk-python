@@ -56,11 +56,12 @@ class LLMClient:
         Raises:
             RuntimeError: if the request fails or the response is unexpected
         """
+        # Strip LiteLLM provider prefix (e.g. "openai/kimi-k2.5" -> "kimi-k2.5")
+        model_name = self.model.split("/", 1)[-1] if "/" in self.model else self.model
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f"{self.api_base}/models",
-                params={"model": self.model},
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                "https://aihubmix.com/api/v1/models",
+                params={"model": model_name},
             )
         if response.status_code != 200:
             raise RuntimeError(

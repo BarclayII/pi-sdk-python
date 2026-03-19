@@ -127,6 +127,7 @@ async def main():
     print("PI SDK Python - Coding Agent")
     print("=" * 60)
     print("\nEnter your request (or 'quit' to exit).")
+    print("Type /compact to manually compact conversation history.")
     print("Press Enter to submit, Esc+Enter for a new line.\n")
 
     while True:
@@ -139,6 +140,15 @@ async def main():
             if user_input.lower() in ("quit", "exit", "q"):
                 print("Goodbye!")
                 break
+
+            if user_input.lower() == "/compact":
+                print("Compacting conversation history...")
+                ok = await agent.compact()
+                if ok:
+                    print(f"Done. Messages reduced to {len(agent.messages)}.\n")
+                else:
+                    print("Nothing to compact (too few messages).\n")
+                continue
 
             # Run the agent loop
             print()
