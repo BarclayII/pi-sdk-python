@@ -96,18 +96,28 @@ class Agent:
             if skills_xml:
                 self.system_prompt += "\n\n" + skills_xml
 
-    async def run(self, user_input: str) -> AsyncGenerator[AgentEvent, None]:
+    async def run(
+        self,
+        user_input: str,
+        response_format: dict | None = None,
+    ) -> AsyncGenerator[AgentEvent, None]:
         """Run the agent loop for a single user input.
 
         Appends the user message and all subsequent assistant/tool messages
         to self.messages, so the caller can issue multiple run() calls for
         multi-round conversations.
 
+        Args:
+            user_input: The user's message text.
+            response_format: Optional structured output format
+                (e.g. {"type": "json_schema", "json_schema": {...}}).
+
         Yields:
             AgentEvent instances for each step of the agent loop.
         """
         yield AgentStart()
 
+        logger.info("User prompt:\n%s", user_input)
         self.messages.append(UserMessage(content=user_input))
 
         for turn in range(self.max_turns):
@@ -119,7 +129,7 @@ class Agent:
             # Stream LLM response
             assistant_message: AssistantMessage | None = None
             async for event in self.llm.stream(
-                self.messages, self.tools, self.system_prompt
+                self.messages, self.tools, self.system_prompt, response_format
             ):
                 if isinstance(event.event, TextDelta):
                     yield TextDelta(delta=event.event.delta)

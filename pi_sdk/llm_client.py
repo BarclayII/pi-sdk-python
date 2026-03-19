@@ -72,13 +72,16 @@ class LLMClient:
             raise RuntimeError("Model info request returned success=false")
         if not data.get("data"):
             raise RuntimeError(f"No model data returned for model '{self.model}'")
-        return data["data"][0]["context_length"]
+
+        entry = [_ for _ in data["data"] if _["model_id"] == model_name][0]
+        return entry["context_length"]
 
     async def stream(
         self,
         messages: list[Message],
         tools: list[Any] | None = None,
         system_prompt: str | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream a completion from the LLM.
 
@@ -86,6 +89,8 @@ class LLMClient:
             messages: List of messages in the conversation
             tools: List of tools (Tool protocol instances)
             system_prompt: Optional system prompt
+            response_format: Optional response format for structured outputs
+                (e.g. {"type": "json_schema", "json_schema": {...}})
 
         Yields:
             StreamEvent with either TextDelta or AssistantMessage
@@ -118,6 +123,9 @@ class LLMClient:
 
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
+
+        if response_format is not None:
+            kwargs["response_format"] = response_format
 
         # Stream the response
         chunks: list[Any] = []
