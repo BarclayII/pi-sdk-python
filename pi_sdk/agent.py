@@ -225,41 +225,12 @@ class Agent:
         if usage.input_tokens < threshold:
             return
 
-        # Keep last 6 messages, but adjust split point to a UserMessage boundary
-        # so we don't leave orphaned ToolResultMessages or AssistantMessages.
-        keep_recent = min(6, len(self.messages))
-        split = len(self.messages) - keep_recent
-        while split < len(self.messages) and not isinstance(
-            self.messages[split], UserMessage
-        ):
-            split += 1
-
-        old_messages = self.messages[:split]
-        recent_messages = self.messages[split:]
-
-        if not old_messages:
-            return
-
         logger.info(
-            "Compacting %d old messages (input_tokens=%d, threshold=%d)",
-            len(old_messages),
+            "Auto-compacting (input_tokens=%d, threshold=%d)",
             usage.input_tokens,
             threshold,
         )
-
-        try:
-            summary = await self._summarize(old_messages)
-        except Exception:
-            logger.warning("Summarization failed, skipping compaction", exc_info=True)
-            return
-
-        if not summary:
-            return
-
-        self.messages = [
-            UserMessage(content=f"<context-summary>\n{summary}\n</context-summary>"),
-            *recent_messages,
-        ]
+        await self.compact()
 
     async def _summarize(self, messages: list[Message]) -> str:
         """Summarize messages via an LLM call."""
@@ -283,52 +254,40 @@ class Agent:
                         result += block.text
         return result
 
-    async def compact(self) -> bool:
+    async def compact(self) -> str | None:
         """Manually compact the conversation history.
 
-        Forces compaction regardless of token usage, summarizing older messages
-        and keeping only the most recent ones.
+        Forces compaction regardless of token usage, summarizing all messages
+        into a summary UserMessage followed by an assistant acknowledgment.
 
         Returns:
-            True if compaction was performed, False if there were too few messages.
+            The summary text if compaction was performed, None otherwise.
         """
         if len(self.messages) < 4:
             logger.info("Skipping compact: fewer than 4 messages")
-            return False
+            return None
 
-        # Keep last 6 messages, adjust split to a UserMessage boundary
-        keep_recent = min(6, len(self.messages))
-        split = len(self.messages) - keep_recent
-        while split < len(self.messages) and not isinstance(
-            self.messages[split], UserMessage
-        ):
-            split += 1
-
-        old_messages = self.messages[:split]
-        recent_messages = self.messages[split:]
-
-        if not old_messages:
-            logger.info("Skipping compact: no old messages to summarize")
-            return False
-
-        logger.info("Manually compacting %d old messages", len(old_messages))
+        logger.info("Manually compacting %d messages", len(self.messages))
 
         try:
-            summary = await self._summarize(old_messages)
+            summary = await self._summarize(self.messages)
         except Exception:
             logger.warning(
                 "Summarization failed during manual compaction", exc_info=True
             )
-            return False
+            return None
 
         if not summary:
-            return False
+            return None
 
         self.messages = [
             UserMessage(content=f"<context-summary>\n{summary}\n</context-summary>"),
-            *recent_messages,
+            AssistantMessage(
+                role="assistant",
+                content=[TextContent(text="Understood, I have the context.")],
+            ),
         ]
-        return True
+        return summary
 
     def reset(self):
         """Clear message history."""

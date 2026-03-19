@@ -143,9 +143,9 @@ async def main():
 
             if user_input.lower() == "/compact":
                 print("Compacting conversation history...")
-                ok = await agent.compact()
-                if ok:
-                    print(f"Done. Messages reduced to {len(agent.messages)}.\n")
+                summary = await agent.compact()
+                if summary:
+                    print(f"\n{summary}\n")
                 else:
                     print("Nothing to compact (too few messages).\n")
                 continue
