@@ -481,50 +481,43 @@ async def run_vote(
     participant_names = list(participants.keys())
     votes: dict[str, dict] = {}
 
-    for name, agent in participants.items():
+    async def _cast_vote(name: str, agent: Agent) -> tuple[str, dict]:
         if vote_type == "kill":
-            # Mafia vote: use explicit valid_targets (all alive players)
             candidates = valid_targets or [p for p in participant_names if p != name]
             prompt_text = mafia_kill_vote_prompt(candidates)
         elif vote_type == "mayor":
-            # Mayor election: can vote for anyone including self
             candidates = valid_targets or participant_names
             prompt_text = mayor_vote_prompt(participant_names)
         else:
             candidates = [p for p in participant_names if p != name]
             prompt_text = vote_prompt(participant_names, name, mayor=mayor)
 
-        # Agents are stateful and already saw the meeting via delta delivery,
-        # so we only send the vote prompt (no redundant transcript).
-        full_prompt = prompt_text
-
-        try:
-            per_voter_stream = (
-                (lambda text, n=name: stream_callback(n, text))
-                if stream_callback
-                else None
-            )
-            parsed = await _get_agent_json(
-                name,
-                agent,
-                full_prompt,
-                stream_callback=per_voter_stream,
-                response_format=VOTE_SCHEMA,
-            )
-        except Exception as e:
-            logger.error("Error getting vote from %s: %s", name, e)
-            parsed = None
+        per_voter_stream = (
+            (lambda text, n=name: stream_callback(n, text)) if stream_callback else None
+        )
+        parsed = await _get_agent_json(
+            name,
+            agent,
+            prompt_text,
+            stream_callback=per_voter_stream,
+            response_format=VOTE_SCHEMA,
+        )
 
         if parsed and "vote" in parsed:
-            # Validate vote target
             vote_target = parsed["vote"]
             if vote_target != "abstain" and vote_target not in candidates:
                 raise ValueError(
                     f"Invalid vote from {name}: '{vote_target}' not in candidates {candidates}"
                 )
-            votes[name] = parsed
+            return name, parsed
         else:
             raise RuntimeError(f"Failed to parse vote from {name} after retries")
+
+    results = await asyncio.gather(
+        *(_cast_vote(name, agent) for name, agent in participants.items())
+    )
+    for name, vote_data in results:
+        votes[name] = vote_data
 
     # Tally votes
     tally: dict[str, int] = {}

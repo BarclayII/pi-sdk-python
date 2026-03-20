@@ -1,5 +1,6 @@
 """Orchestrator for Mafia game phases: night, day, and diary."""
 
+import asyncio
 import logging
 import random
 import shutil
@@ -170,11 +171,8 @@ async def mayor_election_diary_phase(
 
     alive_sorted = sorted(state.alive)
 
-    for name in sorted(state.players):
-        if name not in agent_dirs or name not in agents:
-            continue
+    async def _write_diary(name: str) -> None:
         log_to_agent(agent_dirs[name], "--- Writing diary for Day 0 ---")
-
         prompt = mayor_election_diary_prompt(name, alive_sorted, election_transcript)
         await _get_agent_response(
             name,
@@ -182,8 +180,10 @@ async def mayor_election_diary_phase(
             prompt,
             stream_callback=lambda text, n=name: stream_to_agent(agent_dirs[n], text),
         )
-
         log_to_agent(agent_dirs[name], "Diary written.")
+
+    eligible = [n for n in sorted(state.players) if n in agent_dirs and n in agents]
+    await asyncio.gather(*(_write_diary(n) for n in eligible))
 
 
 async def _handle_mayor_succession(
@@ -666,9 +666,7 @@ async def diary_phase(
         else "(no day meeting this round)"
     )
 
-    for name in sorted(state.players):
-        if name not in agent_dirs or name not in agents:
-            continue
+    async def _write_diary(name: str) -> None:
         log_to_agent(agent_dirs[name], f"--- Writing diary for round {round_id} ---")
 
         # Read night transcript for this player's role
@@ -696,7 +694,6 @@ async def diary_phase(
             name, round_id, alive_sorted, day_transcript, night_transcript
         )
 
-        # The agent will use write tool to create DIARY and KNOWLEDGE files
         await _get_agent_response(
             name,
             agents[name],
@@ -705,6 +702,9 @@ async def diary_phase(
         )
 
         log_to_agent(agent_dirs[name], "Diary written.")
+
+    eligible = [n for n in sorted(state.players) if n in agent_dirs and n in agents]
+    await asyncio.gather(*(_write_diary(n) for n in eligible))
 
 
 async def postgame_phase(
@@ -720,9 +720,7 @@ async def postgame_phase(
         name: [p for p in state.players if p != name] for name in state.players
     }
 
-    for name in sorted(state.players):
-        if name not in agent_dirs or name not in agents:
-            continue
+    async def _reflect(name: str) -> None:
         log_to_agent(agent_dirs[name], "--- Post-game reflection ---")
 
         prompt = postgame_prompt(
@@ -743,3 +741,6 @@ async def postgame_phase(
         )
 
         log_to_agent(agent_dirs[name], "Post-game reflection complete.")
+
+    eligible = [n for n in sorted(state.players) if n in agent_dirs and n in agents]
+    await asyncio.gather(*(_reflect(n) for n in eligible))

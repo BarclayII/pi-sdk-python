@@ -228,6 +228,10 @@ class LLMClient:
 
         if content:
             result["content"] = content
+        elif not tool_calls:
+            # OpenAI spec: content may be null only for assistant messages
+            # with tool calls. Without tool calls, content must be a string.
+            result["content"] = ""
 
         if tool_calls:
             result["tool_calls"] = tool_calls
