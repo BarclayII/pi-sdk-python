@@ -3,10 +3,12 @@
 from typing import Any
 
 ROLE_DESCRIPTION = (
-    "You are the **Doctor**. After the Mafia kills each night, you are told who "
-    "died. You have two one-time abilities: **Save** (revive the killed player) "
-    "and **Poison** (immediately kill another player). Each ability can only be "
-    "used once per game. You may use both in the same night."
+    "You are the **Doctor**. Each night, after the Detective, Mafia, and Guardian "
+    "act simultaneously, you are told who is dead (if anyone). You do not know "
+    "whether a Guardian blocked the kill or the Mafia chose not to kill. You have "
+    "two one-time abilities: **Save** (revive the killed player) and **Poison** "
+    "(immediately kill another player). Each ability can only be used once per "
+    "game. You may use both in the same night."
 )
 
 DOCTOR_ACTION_SCHEMA: dict[str, Any] = {

@@ -6,7 +6,7 @@
 - **Mafia** — Meets at night to choose a victim. Blends in during the day.
 - **Detective** — Investigates one player each night to learn if they are Mafia.
 - **Guardian** — Protects one player per night from being killed. Cannot protect self. Cannot protect the same person on consecutive nights.
-- **Doctor** — After seeing who the Mafia killed, may use a one-time **Save** (revive the killed player) and/or a one-time **Poison** (immediately kill another player). Each ability can only be used once per game.
+- **Doctor** — After the Detective, Mafia, and Guardian act simultaneously, the Doctor is told the outcome (who died, if anyone — without knowing whether a Guardian blocked the kill). May use a one-time **Save** (revive the killed player) and/or a one-time **Poison** (immediately kill another player). Each ability can only be used once per game.
 
 ### Role Distribution
 
@@ -32,37 +32,48 @@ Before the first night, all players elect a **Mayor**:
 The Mayor has three special privileges:
 
 - **Speaks first** in every day meeting.
-- **Double vote** — their elimination vote counts as two votes.
+- **Tiebreaker** — if the elimination vote is split evenly between exactly two options (each receiving half of all votes), the Mayor decides the outcome. "Abstain" counts as a valid option for tiebreaking purposes.
 - **Succession** — if the Mayor dies (killed, poisoned, or voted out), they appoint a surviving player as the new Mayor before leaving the game.
 
 ### 1. Night Phase
 
-Actions happen in this order:
+Actions happen in two phases:
+
+**Phase 1 — Simultaneous actions:**
 
 1. **Detective** (if alive) investigates one living player and learns their alignment.
 2. **Mafia** discusses and votes on a kill target.
    - Single Mafia: chooses directly.
    - Multiple Mafia: discussion then vote; ties mean no consensus (no kill).
    - Can target anyone alive, including fellow Mafia.
-3. **Doctor** (if alive and has remaining abilities) is told who the Mafia killed, then decides:
-   - **Save** (one-time): revive the killed player.
-   - **Poison** (one-time): immediately kill another player.
-   - Both can be used in the same night if still available.
-4. **Guardian** (if alive) chooses one player to protect.
-5. **Resolution**:
-   - If the Doctor saved the Mafia's target, the target survives (regardless of Guardian).
-   - If the Guardian protected the Mafia's target (and Doctor didn't save), the target survives.
-   - If the Doctor poisoned someone, that player also dies (announced alongside any Mafia kill in the day phase).
+3. **Guardian** (if alive) chooses one player to protect.
+
+These three actions happen at the same time (no role sees the others' choices).
+
+**Phase 2 — Doctor (after resolution of Phase 1):**
+
+- Guardian protection is resolved first: if the Guardian protected the Mafia's target, the kill is blocked.
+- **Doctor** (if alive and has remaining abilities) is then told the outcome — either who was killed, or that no one was killed (the Doctor does not learn whether the Guardian intervened or the Mafia simply chose not to kill).
+  - **Save** (one-time): revive the killed player.
+  - **Poison** (one-time): immediately kill another player.
+  - Both can be used in the same night if still available.
+
+**Resolution:**
+
+- If the Doctor saved the Mafia's target, the target survives.
+- If the Doctor poisoned someone, that player also dies (announced alongside any Mafia kill in the day phase).
 
 ### 2. Day Phase
 
 1. **Death announcement** — All players learn who died (if anyone) and their role. This includes both Mafia kills and poison kills.
 2. **Discussion meeting** — All alive players discuss suspicions.
-   - Facilitator uses weighted speaker selection (favoring those who haven't spoken recently or were just mentioned).
+   - Each round, all players privately rate their eagerness to speak (0 = stay silent, 10 = must speak now).
+   - A speaker is selected randomly with exponential probabilities based on eagerness ratings.
    - Players speak in 2–4 sentence turns.
 3. **Elimination vote** — All alive players vote to eliminate one player or abstain.
-   - Requires **strict majority (>50% of alive players)** to eliminate.
-   - If no majority is reached, no one is eliminated.
+   - Requires **majority (≥50% of all voters)** to eliminate. Abstain votes count toward the denominator.
+   - If exactly two options (including "abstain") each receive half of all votes, the Mayor breaks the tie.
+   - If no option reaches majority, no one is eliminated.
    - Players cannot vote for themselves.
 
 ### 3. Diary Phase
@@ -87,7 +98,7 @@ Checked after night resolution and after day elimination.
 | Mafia     | Mafia meeting transcript, identities of fellow Mafia                 |
 | Detective | Own investigation results only                                       |
 | Guardian  | Own protection notes only                                            |
-| Doctor    | Who Mafia killed, own save/poison action notes only                  |
+| Doctor    | Who is dead, own save/poison action notes only                       |
 
 ## Other Rules
 

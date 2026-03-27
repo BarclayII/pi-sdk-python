@@ -1,12 +1,11 @@
-"""Meeting room with facilitator-driven speaker selection and voting."""
+"""Meeting room with eagerness-based speaker selection and voting."""
 
 import asyncio
 import json
-import logging
 import math
 import random
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from pi_sdk import (
@@ -19,13 +18,15 @@ from pi_sdk import (
 )
 
 from prompts import (
-    facilitator_prompt,
+    consensus_prompt,
+    eagerness_prompt,
     mafia_kill_vote_prompt,
+    mayor_tiebreak_prompt,
     mayor_vote_prompt,
     vote_prompt,
 )
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 # --- JSON schemas for structured output ---
@@ -47,28 +48,36 @@ VOTE_SCHEMA: dict[str, Any] = {
     },
 }
 
-FACILITATOR_SCHEMA: dict[str, Any] = {
+EAGERNESS_SCHEMA: dict[str, Any] = {
     "type": "json_schema",
     "json_schema": {
-        "name": "facilitator_weights",
+        "name": "eagerness",
         "strict": True,
         "schema": {
             "type": "object",
             "properties": {
-                "weights": {
-                    "type": "object",
-                    "additionalProperties": {"type": "number"},
-                },
+                "eagerness": {"type": "number"},
+                "reason": {"type": "string"},
+            },
+            "required": ["eagerness", "reason"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+CONSENSUS_SCHEMA: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "consensus",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
                 "consensus_reached": {"type": "boolean"},
                 "consensus_target": {"type": "string"},
                 "reasoning": {"type": "string"},
             },
-            "required": [
-                "weights",
-                "consensus_reached",
-                "consensus_target",
-                "reasoning",
-            ],
+            "required": ["consensus_reached", "consensus_target", "reasoning"],
             "additionalProperties": False,
         },
     },
@@ -98,7 +107,7 @@ async def _llm_single_response(
             return text
         except Exception as e:
             logger.error(
-                "LLM call failed (attempt %d/%d): %s", attempt + 1, retries + 1, e
+                "LLM call failed (attempt {}/{}): {}", attempt + 1, retries + 1, e
             )
             if attempt == retries:
                 return ""
@@ -173,7 +182,7 @@ async def _get_agent_response(
             return text
         except Exception as e:
             logger.error(
-                "Agent %s failed (attempt %d/%d): %s",
+                "Agent {} failed (attempt {}/{}): {}",
                 agent_name,
                 attempt + 1,
                 retries + 1,
@@ -216,19 +225,19 @@ async def _get_agent_json(
 
     for attempt in range(parse_retries + 1):
         try:
-            print(response)
+            logger.debug("Raw JSON response: {}", response)
             return json.loads(_strip_markdown_json(response))
         except (json.JSONDecodeError, TypeError):
             if attempt == parse_retries:
                 logger.warning(
-                    "Failed to parse JSON from %s after %d retries: %s",
+                    "Failed to parse JSON from {} after {} retries: {}",
                     agent_name,
                     parse_retries,
                     response[:200],
                 )
                 return None
             logger.warning(
-                "JSON parse failed for %s (attempt %d), asking to retry",
+                "JSON parse failed for {} (attempt {}), asking to retry",
                 agent_name,
                 attempt + 1,
             )
@@ -243,58 +252,120 @@ async def _get_agent_json(
 
 
 @dataclass
-class FacilitatorResult:
-    """Result from the facilitator including speaker weights and consensus detection."""
+class ConsensusResult:
+    """Result from the facilitator's consensus check."""
 
-    weights: dict[str, float]
     consensus_reached: bool = False
     consensus_target: str = ""
 
 
-async def get_facilitator_weights(
+async def poll_eagerness(
+    participants: dict[str, Agent],
+    transcript_lines: list[str],
+    initialized: set[str],
+    meeting_context: str,
+    latest_speech: str | None = None,
+    stream_callback: Callable[[str, str], None] | None = None,
+) -> dict[str, float]:
+    """Poll all participants for eagerness ratings in parallel.
+
+    Players who haven't been polled yet receive the full meeting_context +
+    transcript. Players who have been polled before receive only the latest
+    speech (since they already have prior context in their conversation history).
+
+    Args:
+        participants: Mapping of agent_name -> Agent.
+        transcript_lines: Full transcript so far.
+        initialized: Set of player names who have already been polled at least
+            once. Updated in-place to include newly polled players.
+        meeting_context: Context string for first-time players.
+        latest_speech: The most recent transcript line (e.g. "**alice**: ...").
+            None on the very first poll when no one has spoken yet.
+        stream_callback: Optional (agent_name, text_chunk) callback.
+
+    Returns a dict of participant_name -> eagerness rating (float).
+    Falls back to 0.0 for any participant whose response fails.
+    """
+
+    async def _poll_one(name: str, agent: Agent) -> tuple[str, float]:
+        if name not in initialized:
+            # First poll: full meeting context + transcript
+            transcript_so_far = (
+                "\n".join(transcript_lines)
+                if transcript_lines
+                else "(meeting just started)"
+            )
+            context = (
+                f"{meeting_context}\n\nMeeting transcript so far:\n{transcript_so_far}"
+            )
+        else:
+            # Subsequent poll: only the latest speech
+            context = latest_speech or "(no new messages)"
+
+        prompt = eagerness_prompt(context)
+        per_player_stream = (
+            (lambda text, n=name: stream_callback(n, text)) if stream_callback else None
+        )
+        parsed = await _get_agent_json(
+            name,
+            agent,
+            prompt,
+            stream_callback=per_player_stream,
+            response_format=EAGERNESS_SCHEMA,
+        )
+
+        initialized.add(name)
+
+        if isinstance(parsed, dict) and "eagerness" in parsed:
+            rating = float(parsed["eagerness"])
+            # Clamp to [0, 10]
+            rating = max(0, min(10.0, rating))
+            logger.info(
+                "Eagerness {}: {:.1f} ({})", name, rating, parsed.get("reason", "")
+            )
+            return name, rating
+
+        logger.warning("Failed to get eagerness from {}, defaulting to 0.0", name)
+        return name, 0.0
+
+    results = await asyncio.gather(
+        *(_poll_one(name, agent) for name, agent in participants.items())
+    )
+    return dict(results)
+
+
+async def check_consensus(
     facilitator: Agent,
     participants: list[str],
     transcript_lines: list[str],
-) -> FacilitatorResult:
-    """Ask the facilitator agent for speaker weights and consensus detection.
+) -> ConsensusResult:
+    """Ask the facilitator if unanimous consensus has been reached.
 
-    Returns a FacilitatorResult with weights and consensus info. Falls back to
-    uniform weights with no consensus if the response can't be parsed.
+    Returns a ConsensusResult. Falls back to no consensus on parse failure.
     """
-    default = FacilitatorResult(weights={p: 1.0 for p in participants})
-
-    # Start with fresh context each time — no accumulated history.
     facilitator.reset()
     recent = (
         "\n".join(transcript_lines[-20:]) if transcript_lines else "(no transcript yet)"
     )
-    prompt = facilitator_prompt(participants, recent)
+    prompt = consensus_prompt(participants, recent)
     parsed = await _get_agent_json(
         "facilitator",
         facilitator,
         prompt,
-        response_format=FACILITATOR_SCHEMA,
+        response_format=CONSENSUS_SCHEMA,
     )
 
     if not parsed:
-        return default
+        return ConsensusResult()
 
-    weights = parsed.get("weights", {})
-    valid = all(
-        p in weights and isinstance(weights[p], (int, float)) for p in participants
+    reasoning = parsed.get("reasoning", "")
+    if reasoning:
+        logger.info("Facilitator reasoning: {}", reasoning)
+
+    return ConsensusResult(
+        consensus_reached=bool(parsed.get("consensus_reached", False)),
+        consensus_target=str(parsed.get("consensus_target", "")),
     )
-    if valid:
-        reasoning = parsed.get("reasoning", "")
-        if reasoning:
-            logger.info("Facilitator reasoning: %s", reasoning)
-        return FacilitatorResult(
-            weights={p: float(weights[p]) for p in participants},
-            consensus_reached=bool(parsed.get("consensus_reached", False)),
-            consensus_target=str(parsed.get("consensus_target", "")),
-        )
-
-    logger.warning("Invalid facilitator weights, using uniform")
-    return default
 
 
 async def run_meeting(
@@ -306,19 +377,29 @@ async def run_meeting(
     log_callback: Callable[[str, str], None] | None = None,
     stream_callback: Callable[[str, str], None] | None = None,
     first_speaker: str | None = None,
+    use_llm_consensus: bool = False,
 ) -> list[str]:
-    """Run a meeting with facilitator-driven speaker selection.
+    """Run a meeting with eagerness-based speaker selection.
+
+    Each round, all players rate their eagerness to speak (-10 to 10).
+    A speaker is selected via exponentially-weighted random choice.
+    The meeting ends early if all participants' eagerness is negative
+    (eagerness-based consensus). Optionally, an LLM facilitator can also
+    check for unanimous consensus after each speech.
 
     Args:
         participants: Mapping of agent_name -> Agent.
-        facilitator: Agent used for speaker selection and speech validation.
+        facilitator: Agent used for speech validation (and consensus detection
+            when use_llm_consensus is True).
         transcript_path: Path to write the transcript file.
         max_rounds: Number of speaking rounds.
-        meeting_context: Context string prepended to each agent's prompt.
+        meeting_context: Context string prepended to each agent's first prompt.
         log_callback: Optional (agent_name, message) callback for tmux logging.
         stream_callback: Optional (agent_name, text_chunk) callback for real-time
             streaming of LLM output and tool events to tmux windows.
         first_speaker: Optional player name to force as speaker for round 0.
+        use_llm_consensus: If True, also run LLM-based consensus detection
+            after each speech (more expensive but more nuanced).
 
     Returns:
         List of transcript lines.
@@ -326,8 +407,8 @@ async def run_meeting(
     participant_names = list(participants.keys())
     transcript_lines: list[str] = []
     last_speaker: str | None = None
-    last_seen_index: dict[str, int] = {name: 0 for name in participant_names}
-    has_spoken: set[str] = set()
+    initialized: set[str] = set()
+    latest_speech: str | None = None
 
     with open(transcript_path, "w") as f:
         f.write(f"=== Meeting Transcript ===\n\n")
@@ -335,39 +416,58 @@ async def run_meeting(
     for round_num in range(max_rounds):
         # Force first_speaker for round 0 if set and alive
         if round_num == 0 and first_speaker and first_speaker in participants:
+            # Still send eagerness poll to other players so they get the meeting context
+            others = {n: a for n, a in participants.items() if n != first_speaker}
+            if others:
+                await poll_eagerness(
+                    others,
+                    transcript_lines,
+                    initialized,
+                    meeting_context,
+                    latest_speech=latest_speech,
+                    stream_callback=stream_callback,
+                )
             speaker = first_speaker
         else:
-            # Get facilitator weights and consensus signal
-            result = await get_facilitator_weights(
-                facilitator, participant_names, transcript_lines
+            # Poll all players for eagerness
+            eagerness = await poll_eagerness(
+                participants,
+                transcript_lines,
+                initialized,
+                meeting_context,
+                latest_speech=latest_speech,
+                stream_callback=stream_callback,
             )
 
-            # Check for unanimous consensus — end meeting early
-            if result.consensus_reached and result.consensus_target:
+            # Prevent consecutive same speaker
+            if last_speaker and last_speaker in eagerness and len(eagerness) > 1:
+                eagerness[last_speaker] = float("-inf")
+
+            # Eagerness-based consensus: if everyone's eagerness is negative,
+            # end the meeting (players have nothing more to say)
+            if transcript_lines and all(v <= 0 for v in eagerness.values()):
                 logger.info(
-                    "Early termination at round %d: unanimous consensus on %s",
+                    "Eagerness consensus at round {}: all players' eagerness is nonpositive, ending meeting",
                     round_num + 1,
-                    result.consensus_target,
                 )
                 break
 
-            # Prevent consecutive same speaker
-            if (
-                last_speaker
-                and last_speaker in result.weights
-                and len(result.weights) > 1
-            ):
-                result.weights[last_speaker] = float("-inf")
-
-            # Exponentiate raw weights to get unnormalized probabilities
-            names = list(result.weights.keys())
-            weight_values = [math.exp(result.weights[n]) for n in names]
+            # Exponentiate eagerness to get unnormalized probabilities
+            names = list(eagerness.keys())
+            weight_values = [
+                math.exp(eagerness[n]) if eagerness[n] > 0 else 0 for n in names
+            ]
             speaker = random.choices(names, weights=weight_values, k=1)[0]
+
         logger.info(f"Orchestrator picked {speaker}.")
 
-        # Build prompt with delta transcript
-        if speaker not in has_spoken:
-            # First turn: full context + all lines so far
+        if log_callback:
+            log_callback(speaker, f"[Round {round_num + 1}] Speaking...")
+
+        # The speaker already has transcript context from the eagerness poll.
+        # Just tell them it's their turn to speak.
+        if speaker not in initialized:
+            # First speaker in round 0 with forced speaker — needs full context
             transcript_so_far = (
                 "\n".join(transcript_lines)
                 if transcript_lines
@@ -379,26 +479,9 @@ Meeting transcript so far:
 {transcript_so_far}
 
 It's your turn to speak. Keep your response to 2-4 sentences."""
+            initialized.add(speaker)
         else:
-            # Subsequent turns: delta only
-            logger.info(
-                f"Last message spoken: {transcript_lines[last_seen_index[speaker]]}"
-            )
-            assert transcript_lines[last_seen_index[speaker]].startswith(
-                f"**{speaker}**"
-            )
-            new_lines = transcript_lines[last_seen_index[speaker] + 1 :]
-            if new_lines:
-                delta = "\n".join(new_lines)
-                prompt = f"""New messages since you last spoke:
-{delta}
-
-It's your turn to speak. Keep your response to 2-4 sentences."""
-            else:
-                prompt = "No new messages. It's your turn to speak. Keep your response to 2-4 sentences."
-
-        if log_callback:
-            log_callback(speaker, f"[Round {round_num + 1}] Speaking...")
+            prompt = "It's your turn to speak. Keep your response to 2-4 sentences."
 
         # Get agent response
         agent = participants[speaker]
@@ -413,7 +496,7 @@ It's your turn to speak. Keep your response to 2-4 sentences."""
         # Extract public speech from <speak> tags; no tag means silence
         speech = _extract_speak(response)
         if not speech:
-            logger.info("Round %d - %s: (stayed silent)", round_num + 1, speaker)
+            logger.info("Round {} - {}: (stayed silent)", round_num + 1, speaker)
             continue
 
         # Validate: check for third-person self-reference
@@ -422,7 +505,7 @@ It's your turn to speak. Keep your response to 2-4 sentences."""
         )
         if not perspective_ok:
             logger.warning(
-                "Round %d - %s: third-person speech detected, retrying",
+                "Round {} - {}: third-person speech detected, retrying",
                 round_num + 1,
                 speaker,
             )
@@ -438,23 +521,101 @@ It's your turn to speak. Keep your response to 2-4 sentences."""
             speech = _extract_speak(response)
             if not speech:
                 logger.info(
-                    "Round %d - %s: (stayed silent on retry)", round_num + 1, speaker
+                    "Round {} - {}: (stayed silent on retry)", round_num + 1, speaker
                 )
                 continue
 
         line = f"**{speaker}**: {speech}"
         transcript_lines.append(line)
-        last_seen_index[speaker] = len(transcript_lines) - 1
-        has_spoken.add(speaker)
+        latest_speech = line
         last_speaker = speaker
 
         # Append to transcript file
         with open(transcript_path, "a") as f:
             f.write(f"{line}\n\n")
 
-        logger.info("Round %d - %s: %s", round_num + 1, speaker, speech)
+        logger.info("Round {} - {}: {}", round_num + 1, speaker, speech)
+
+        # Check for LLM-based consensus (optional, more expensive)
+        if use_llm_consensus:
+            result = await check_consensus(
+                facilitator, participant_names, transcript_lines
+            )
+            if result.consensus_reached and result.consensus_target:
+                logger.info(
+                    "Early termination at round {}: LLM facilitator detected consensus on {}",
+                    round_num + 1,
+                    result.consensus_target,
+                )
+                break
 
     return transcript_lines
+
+
+async def _mayor_tiebreak(
+    mayor_name: str,
+    mayor_agent: Agent,
+    tied_options: list[str],
+    stream_callback: Callable[[str, str], None] | None = None,
+    max_retries: int = 2,
+) -> str:
+    """Ask the mayor to break a tie between two options, retrying on invalid choice."""
+    per_mayor_stream = (
+        (lambda text: stream_callback(mayor_name, text)) if stream_callback else None
+    )
+    options_str = ", ".join(f'"{opt}"' for opt in tied_options)
+    prompt_text = mayor_tiebreak_prompt(tied_options)
+
+    for attempt in range(max_retries + 1):
+        parsed = await _get_agent_json(
+            mayor_name,
+            mayor_agent,
+            prompt_text,
+            stream_callback=per_mayor_stream,
+            response_format=VOTE_SCHEMA,
+        )
+        if isinstance(parsed, dict) and "vote" in parsed:
+            choice = parsed["vote"]
+            if choice in tied_options:
+                logger.info(
+                    "Mayor {} broke the tie by choosing: {}", mayor_name, choice
+                )
+                return choice
+            logger.warning(
+                "Mayor {} chose invalid option '{}' (attempt {}/{})",
+                mayor_name,
+                choice,
+                attempt + 1,
+                max_retries + 1,
+            )
+            if attempt < max_retries:
+                prompt_text = (
+                    f'Your choice "{choice}" is not valid. '
+                    f"You must choose one of: {options_str}. Please try again.\n\n"
+                    f'Return ONLY valid JSON: {{"vote": "<option>", "reasoning": "..."}}'
+                )
+                continue
+        else:
+            logger.warning(
+                "Failed to parse mayor tiebreak response (attempt {}/{})",
+                attempt + 1,
+                max_retries + 1,
+            )
+            if attempt < max_retries:
+                prompt_text = (
+                    "Your response could not be parsed. "
+                    f"You must choose one of: {options_str}.\n\n"
+                    f'Return ONLY valid JSON: {{"vote": "<option>", "reasoning": "..."}}'
+                )
+                continue
+
+    # Fallback: pick randomly from the tied options
+    fallback = random.choice(tied_options)
+    logger.warning(
+        "Mayor tiebreak failed after retries, falling back to random choice: {}",
+        fallback,
+    )
+    return fallback
 
 
 async def run_vote(
@@ -503,7 +664,7 @@ async def run_vote(
             response_format=VOTE_SCHEMA,
         )
 
-        if parsed and "vote" in parsed:
+        if isinstance(parsed, dict) and "vote" in parsed:
             vote_target = parsed["vote"]
             if vote_target != "abstain" and vote_target not in candidates:
                 raise ValueError(
@@ -519,13 +680,16 @@ async def run_vote(
     for name, vote_data in results:
         votes[name] = vote_data
 
-    # Tally votes
+    # Tally votes (including abstain as a valid option for elimination votes)
     tally: dict[str, int] = {}
     for voter, vote_data in votes.items():
         target = vote_data["vote"]
-        if target != "abstain":
-            weight = 2 if (vote_type == "eliminate" and voter == mayor) else 1
-            tally[target] = tally.get(target, 0) + weight
+        if vote_type == "eliminate":
+            # Count all votes including abstain
+            tally[target] = tally.get(target, 0) + 1
+        else:
+            if target != "abstain":
+                tally[target] = tally.get(target, 0) + 1
 
     if not tally:
         return None, votes
@@ -533,23 +697,47 @@ async def run_vote(
     max_votes = max(tally.values())
     tied = [name for name, count in tally.items() if count == max_votes]
 
-    # Ties mean no consensus — no action taken
-    if len(tied) > 1:
-        logger.info("Vote tied between %s — no consensus reached", tied)
-        return None, votes
-
-    winner = tied[0]
-
-    # For elimination votes, require strict majority (> half of total vote weight)
+    # For elimination votes, require majority (>= half of all voters, abstain counts in denominator)
     if vote_type == "eliminate":
-        total_weight = len(participants) + (1 if mayor and mayor in participants else 0)
-        majority_threshold = total_weight / 2
-        if max_votes <= majority_threshold:
+        total_voters = len(votes)
+        majority_threshold = total_voters / 2
+        if max_votes < majority_threshold:
             logger.info(
-                "No elimination: top vote count %d does not exceed majority threshold %.1f",
+                "No elimination: top vote count {} does not reach majority threshold {:.1f}",
                 max_votes,
                 majority_threshold,
             )
             return None, votes
 
+        # Exactly two options tied at half — mayor breaks the tie
+        if (
+            len(tied) == 2
+            and max_votes == majority_threshold
+            and mayor
+            and mayor in participants
+        ):
+            logger.info("Tie between {} — mayor {} will break the tie", tied, mayor)
+            tiebreak_winner = await _mayor_tiebreak(
+                mayor, participants[mayor], tied, stream_callback
+            )
+            if tiebreak_winner == "abstain":
+                return None, votes
+            return tiebreak_winner, votes
+
+        # More than 2-way tie or no option reaches majority
+        if len(tied) > 1:
+            logger.info("Vote tied between {} — no consensus reached", tied)
+            return None, votes
+
+        winner = tied[0]
+        if winner == "abstain":
+            return None, votes
+        return winner, votes
+
+    # Non-elimination votes: ties mean no consensus
+    if len(tied) > 1:
+        logger.info("Vote tied between {} — no consensus reached", tied)
+        return None, votes
+
+    winner = tied[0]
     return winner, votes

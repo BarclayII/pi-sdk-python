@@ -13,15 +13,22 @@ def agent_system_prompt(
         allies_str = ", ".join(mafia_allies)
         mafia_section = f"\n\nYour fellow Mafia members are: {allies_str}. Coordinate with them during night meetings and protect each other during the day."
 
-    return f"""{personality}
+    return f"""
+You are {agent_name}, playing a Mafia game.  You have access to four tools: (1) read - read a file's contents, (2) edit - edit a file, (3) write - write contents to a new file, (4) bash - execute any Linux shell command such as grep, ls, cat, etc.
+
+The rules are in RULES.md.  Make sure you read the rules before engaging with others.
 
 {role_description}{mafia_section}
 
-You are {agent_name}, playing a Mafia game. You have diary files (DIARY_<round>.txt) and a lessons learned file (LESSONS_LEARNED.md) in your working directory. You may also have knowledge files (KNOWLEDGE_<name>.txt) from previous games. Read them to recall what happened in previous rounds and games.
+{personality}
+
+You may have diary files (DIARY_<round>.txt) and a lessons learned file (LESSONS_LEARNED.md) in your working directory. You may also have knowledge files (KNOWLEDGE_<name>.txt) from previous games. Read them to recall what happened in previous rounds and games.
 
 Your working directory also contains transcripts (DAY_<round>.txt, NIGHT_*.txt) you're allowed to see.
 
 IMPORTANT: Keep your responses concise (2-4 sentences per speaking turn). Stay in character. Do NOT reveal your role unless it's strategically beneficial.
+
+IMPORTANT: When speaking, voting, or answering questions, respond with plain text in your message. NEVER use bash commands (like echo) or write to files to deliver your answers.
 
 When speaking in meetings, wrap your public speech in <speak>...</speak> tags. Only the content inside these tags will be visible to other players. You may read files and think privately outside the tags. If you choose not to include a <speak> tag, you will remain silent this round."""
 
@@ -45,7 +52,7 @@ def phase_context_prompt(
         f"Mafia members remaining: {mafia_alive_count}",
     ]
     if mayor:
-        parts.append(f"Current Mayor: {mayor} (speaks first, vote counts double)")
+        parts.append(f"Current Mayor: {mayor} (speaks first, breaks tiebreaks)")
     if mafia_allies_alive is not None:
         allies_str = (
             ", ".join(mafia_allies_alive)
@@ -56,31 +63,37 @@ def phase_context_prompt(
     return "\n".join(parts)
 
 
-def facilitator_prompt(participants: list[str], transcript_recent: str) -> str:
-    """Build the prompt for the facilitator to return speaker weights."""
+def eagerness_prompt(new_messages: str) -> str:
+    """Build the prompt for a player to rate their eagerness to speak."""
+    return f"""New in the discussion:
+{new_messages}
+
+Rate your eagerness to speak next on a scale from 0 (stay silent) to 10 (must speak now). Consider:
+- Do you have something important to say?
+- Were you just mentioned or accused?
+- Is there information you need to share or a point you need to make?
+
+Return ONLY valid JSON: {{"eagerness": <number from 0 to 10>, "reason": "brief reason"}}"""
+
+
+def consensus_prompt(participants: list[str], transcript_recent: str) -> str:
+    """Build the prompt for the facilitator to check if consensus has been reached."""
     participants_str = ", ".join(participants)
-    return f"""You are a meeting facilitator for a Mafia game discussion. Your job is to decide who should speak next and to detect when unanimous consensus has been reached.
+    return f"""You are a meeting facilitator for a Mafia game discussion. Your job is to detect when unanimous consensus has been reached.
 
 Current participants: {participants_str}
 
 Recent transcript:
 {transcript_recent}
 
-Return ONLY valid JSON with weights, consensus detection, and brief reasoning:
-{{"weights": {{{", ".join(f'"{p}": <weight>' for p in participants)}}}, "consensus_reached": <true or false>, "consensus_target": "<player name or empty string or "no target">", "reasoning": "..."}}
-
-Speaker weight rules:
-- Who hasn't spoken recently should have higher weight
-- Who was just mentioned or accused should have higher weight
-- Add variety — don't always pick the same person
-- Weights can be any real number (positive or negative). They will be exponentiated (exp(x)) to form selection probabilities, so a difference of 1 means ~2.7x more likely
-
 Consensus detection rules:
 - Set consensus_reached to true ONLY if every participant has explicitly and clearly agreed on the same target (unanimous agreement) or "no target"
 - Silence, vague statements, or "going along" do NOT count — each participant must have stated their position
 - If even one participant disagrees or hasn't stated a clear position, consensus_reached must be false
 - When consensus_reached is true, set consensus_target to the agreed-upon player name or "no target" (if everybody decided not to vote)
-- When consensus_reached is false, set consensus_target to an empty string"""
+- When consensus_reached is false, set consensus_target to an empty string
+
+Return ONLY valid JSON: {{"consensus_reached": <true or false>, "consensus_target": "<player name or empty string or no target>", "reasoning": "..."}}"""
 
 
 def vote_prompt(
@@ -91,11 +104,11 @@ def vote_prompt(
     candidates_str = ", ".join(candidates)
     mayor_note = ""
     if mayor and mayor in alive_players:
-        mayor_note = f"\nNote: {mayor} is the Mayor — their vote counts double.\n"
+        mayor_note = f"\nNote: {mayor} is the Mayor — if there is an exact tie between two options (each receiving half of all votes), the Mayor decides the outcome.\n"
     return f"""The discussion is over. You must now vote to eliminate one player, or choose to abstain.
 Candidates: {candidates_str}
 
-A player is only eliminated if strictly more than half of all alive players vote for them.{mayor_note}
+A player is eliminated if at least half of all alive players vote for them (abstentions count toward the total).{mayor_note}
 
 Return ONLY valid JSON: {{"vote": "<player_name>" or "abstain", "reasoning": "..."}}
 
@@ -150,7 +163,7 @@ def mayor_election_diary_prompt(
 def mafia_kill_vote_prompt(targets: list[str]) -> str:
     """Prompt mafia members to vote on who to kill."""
     targets_str = ", ".join(targets)
-    return f"""The Mafia discussion is over. Vote on who to kill tonight, or vote "abstain" to skip.
+    return f"""The Mafia discussion is over. Vote on who to kill tonight, or vote "abstain" to skip or spare everyone.
 You may target anyone — including fellow Mafia members or even yourself (risky, but the guardian might protect you).
 Possible targets: {targets_str}
 
@@ -233,7 +246,7 @@ def mayor_election_meeting_prompt(alive_players: list[str]) -> str:
 Alive players: {players_str}
 
 Before the first night, the town must elect a Mayor.
-The Mayor speaks first in every day meeting and their elimination vote counts double.
+The Mayor speaks first in every day meeting and breaks ties if the elimination vote is split evenly between two options.
 If the Mayor dies, they appoint a successor from the surviving players.
 
 Discuss who should be Mayor. Consider leadership ability, trustworthiness, and strategy.
@@ -252,6 +265,21 @@ The player with the most votes becomes Mayor (simple plurality).
 Return ONLY valid JSON: {{"vote": "<player_name>", "reasoning": "..."}}
 
 Your vote MUST be one of the listed candidates."""
+
+
+def mayor_tiebreak_prompt(tied_options: list[str]) -> str:
+    """Prompt the mayor to break a tie between two options."""
+    options_str = ", ".join(f'"{opt}"' for opt in tied_options)
+    return f"""The elimination vote has resulted in a tie. As Mayor, you must break the tie.
+
+The tied options are: {options_str}
+("abstain" means no one is eliminated.)
+
+Choose one of the tied options to determine the outcome.
+
+Return ONLY valid JSON: {{"vote": "<option>", "reasoning": "..."}}
+
+Your vote MUST be one of: {options_str}."""
 
 
 def mayor_succession_prompt(dying_mayor: str, alive_players: list[str]) -> str:

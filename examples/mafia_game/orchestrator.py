@@ -1,7 +1,6 @@
 """Orchestrator for Mafia game phases: night, day, and diary."""
 
 import asyncio
-import logging
 import random
 import shutil
 from collections import Counter
@@ -36,7 +35,7 @@ from roles import (
 )
 from tmux_utils import log_to_agent, mark_agent_dead, stream_to_agent
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 def _distribute_transcript(
@@ -92,6 +91,7 @@ async def mayor_election_phase(
     facilitator: Agent,
     mayor_rounds: int,
     session_name: str,
+    use_llm_consensus: bool = False,
 ) -> None:
     """Run the Day 0 mayor election: discussion + vote."""
     data_dir = Path(state.data_dir)
@@ -114,6 +114,7 @@ async def mayor_election_phase(
         meeting_context=meeting_context,
         log_callback=lambda name, msg: log_to_agent(agent_dirs[name], msg),
         stream_callback=lambda name, text: stream_to_agent(agent_dirs[name], text),
+        use_llm_consensus=use_llm_consensus,
     )
 
     # Vote for mayor (simple plurality, can vote for self)
@@ -135,7 +136,7 @@ async def mayor_election_phase(
 
     if winner:
         state.mayor = winner
-        logger.info("Mayor elected: %s", winner)
+        logger.info("Mayor elected: {}", winner)
         for name in state.alive:
             log_to_agent(agent_dirs[name], f"Mayor elected: {winner}")
     else:
@@ -147,7 +148,7 @@ async def mayor_election_phase(
             max_count = max(tally.values())
             tied = [n for n, c in tally.items() if c == max_count]
             state.mayor = random.choice(tied)
-            logger.info("Mayor tie — randomly selected: %s", state.mayor)
+            logger.info("Mayor tie — randomly selected: {}", state.mayor)
             for name in state.alive:
                 log_to_agent(
                     agent_dirs[name], f"Mayor elected (tiebreak): {state.mayor}"
@@ -202,7 +203,7 @@ async def _handle_mayor_succession(
         state.mayor = None
         return
 
-    logger.info("Mayor %s is dying — appointing successor", dead_player)
+    logger.info("Mayor {} is dying — appointing successor", dead_player)
 
     # Ask the dying mayor to appoint a successor (they're still in agents dict)
     if dead_player in agents:
@@ -221,7 +222,7 @@ async def _handle_mayor_succession(
             and parsed["vote"] != dead_player
         ):
             state.mayor = parsed["vote"]
-            logger.info("New mayor appointed: %s", state.mayor)
+            logger.info("New mayor appointed: {}", state.mayor)
             for name in state.alive:
                 log_to_agent(
                     agent_dirs[name],
@@ -231,7 +232,7 @@ async def _handle_mayor_succession(
 
     # Fallback: if parsing fails or invalid, pick the first alive player
     state.mayor = alive_list[0]
-    logger.info("Mayor succession fallback: %s", state.mayor)
+    logger.info("Mayor succession fallback: {}", state.mayor)
     for name in state.alive:
         log_to_agent(
             agent_dirs[name],
@@ -246,6 +247,7 @@ async def night_phase(
     facilitator: Agent,
     mafia_rounds: int,
     session_name: str,
+    use_llm_consensus: bool = False,
 ) -> tuple[str | None, str | None]:
     """Run the night phase.
 
@@ -256,9 +258,14 @@ async def night_phase(
     data_dir.mkdir(parents=True, exist_ok=True)
     round_id = state.round_id
 
-    # === DETECTIVE PHASE ===
-    detectives = state.get_by_role("detective")
-    if detectives:
+    # === PHASE 1: Detective, Mafia, and Guardian act simultaneously ===
+    killed = None
+    protected = None
+
+    async def _detective_action() -> None:
+        detectives = state.get_by_role("detective")
+        if not detectives:
+            return
         detective = detectives[0]
         log_to_agent(agent_dirs[detective], f"--- Night {round_id}: Investigation ---")
 
@@ -274,7 +281,7 @@ async def night_phase(
         )
 
         investigated = None
-        if parsed and "investigate" in parsed:
+        if isinstance(parsed, dict) and "investigate" in parsed:
             target = parsed["investigate"]
             if target in state.alive and target != detective:
                 investigated = target
@@ -294,17 +301,18 @@ async def night_phase(
         _distribute_transcript(str(notes_path), agent_dirs, [detective])
         log_to_agent(agent_dirs[detective], result_text.strip())
 
-    # === MAFIA MEETING ===
-    mafia_members = state.get_by_role("mafia")
-    killed = None
-    if mafia_members:
+    async def _mafia_action() -> str | None:
+        mafia_members = state.get_by_role("mafia")
+        if not mafia_members:
+            return None
+
         for m in mafia_members:
             log_to_agent(agent_dirs[m], f"--- Night {round_id}: Mafia Meeting ---")
 
         transcript_path = str(data_dir / f"NIGHT_MAFIA_{round_id}.txt")
+        target = None
 
         if len(mafia_members) == 1:
-            # Solo mafia: just ask who to kill directly
             mafia_name = mafia_members[0]
             agent = agents[mafia_name]
             others = sorted(state.alive)
@@ -313,10 +321,11 @@ async def night_phase(
             context = _phase_context(state, "Night — Mafia Decision", mafia_name)
             prompt = (
                 f"{context}\n\n"
-                f"You are the only Mafia member. Choose someone to eliminate tonight.\n"
+                f"You are the only Mafia member. Choose someone to eliminate tonight, "
+                f"or vote 'abstain' to keep everyone alive.\n"
                 f"You may target anyone — including yourself (risky, but the guardian might save you).\n"
                 f"Alive players: {others_str}\n\n"
-                f'Return ONLY valid JSON: {{"vote": "<player_name>", "reasoning": "..."}}'
+                f'Return ONLY valid JSON: {{"vote": "<player_name> or abstain", "reasoning": "..."}}'
             )
             parsed = await _get_agent_json(
                 mafia_name,
@@ -328,26 +337,29 @@ async def night_phase(
                 response_format=VOTE_SCHEMA,
             )
 
-            if parsed and "vote" in parsed and parsed["vote"] in others:
-                killed = parsed["vote"]
+            if isinstance(parsed, dict) and "vote" in parsed:
+                vote = parsed["vote"]
+                if vote == "abstain":
+                    target = None
+                elif vote in others:
+                    target = vote
 
-            # Write transcript (no reasoning)
             with open(transcript_path, "w") as f:
                 f.write(f"=== Night {round_id} - Mafia Decision ===\n\n")
                 f.write(
-                    f"{mafia_name} decided to {'kill ' + killed if killed else 'skip killing'}.\n"
+                    f"{mafia_name} decided to {'kill ' + target if target else 'skip killing'}.\n"
                 )
         else:
-            # Multi-mafia: send phase context to each, then run meeting + vote
             mafia_agents = {m: agents[m] for m in mafia_members}
 
             meeting_context = (
                 f"{_phase_context(state, 'Night — Mafia Meeting')}\n\n"
                 "This is a secret Mafia meeting. Discuss who to eliminate tonight. "
+                "You may also choose to keep everyone alive. "
                 "Only Mafia members are present. Be strategic."
             )
 
-            transcript_lines = await run_meeting(
+            await run_meeting(
                 participants=mafia_agents,
                 facilitator=facilitator,
                 transcript_path=transcript_path,
@@ -357,11 +369,11 @@ async def night_phase(
                 stream_callback=lambda name, text: stream_to_agent(
                     agent_dirs[name], text
                 ),
+                use_llm_consensus=use_llm_consensus,
             )
 
-            # Vote on kill target — mafia can target anyone, including fellow mafia
             all_targets = sorted(state.alive)
-            killed, vote_results = await run_vote(
+            target, vote_results = await run_vote(
                 participants=mafia_agents,
                 vote_type="kill",
                 valid_targets=all_targets,
@@ -370,20 +382,93 @@ async def night_phase(
                 ),
             )
 
-            # Append vote results to transcript (no reasoning)
             with open(transcript_path, "a") as f:
                 f.write("\n=== Mafia Vote ===\n")
                 for voter, data in vote_results.items():
                     f.write(f"{voter} voted: {data['vote']}\n")
-                f.write(f"\nTarget: {killed or 'no kill'}\n")
+                f.write(f"\nTarget: {target or 'no kill'}\n")
 
-        # Distribute night transcript to mafia only
         _distribute_transcript(transcript_path, agent_dirs, mafia_members)
 
         for m in mafia_members:
-            log_to_agent(agent_dirs[m], f"Mafia target: {killed or 'no one'}")
+            log_to_agent(agent_dirs[m], f"Mafia target: {target or 'no one'}")
 
-    # === DOCTOR PHASE (after mafia, before guardian) ===
+        return target
+
+    async def _guardian_action() -> str | None:
+        guardians = state.get_by_role("guardian")
+        if not guardians:
+            return None
+
+        guardian_name = guardians[0]
+        log_to_agent(
+            agent_dirs[guardian_name], f"--- Night {round_id}: Guardian Decision ---"
+        )
+
+        agent = agents[guardian_name]
+        context = _phase_context(state, "Night — Guardian Decision", guardian_name)
+        prompt = (
+            context
+            + "\n\n"
+            + guardian_prompt(
+                sorted(state.alive), guardian_name, state.guardian_last_protected
+            )
+        )
+        parsed = await _get_agent_json(
+            guardian_name,
+            agent,
+            prompt,
+            stream_callback=lambda text: stream_to_agent(
+                agent_dirs[guardian_name], text
+            ),
+            response_format=PROTECT_SCHEMA,
+        )
+
+        notes_parts = [f"Night {round_id} Guardian Notes:\n"]
+        result = None
+
+        if isinstance(parsed, dict) and parsed.get("protect"):
+            protect_target = parsed["protect"]
+            valid_targets = [
+                p
+                for p in state.alive
+                if p != guardian_name and p != state.guardian_last_protected
+            ]
+            if protect_target in valid_targets:
+                result = protect_target
+                state.guardian_last_protected = result
+                notes_parts.append(f"You protected {result} tonight.\n")
+            else:
+                notes_parts.append(
+                    f"Invalid target '{protect_target}'. No one was protected.\n"
+                )
+                state.guardian_last_protected = None
+
+            if parsed.get("reasoning"):
+                notes_parts.append(f"Reasoning: {parsed['reasoning']}\n")
+        else:
+            notes_parts.append("Decision failed (invalid response).\n")
+            state.guardian_last_protected = None
+
+        notes_path = data_dir / f"NIGHT_GUARDIAN_NOTES_{round_id}.txt"
+        notes_path.write_text("\n".join(notes_parts))
+        _distribute_transcript(str(notes_path), agent_dirs, [guardian_name])
+        log_to_agent(agent_dirs[guardian_name], "\n".join(notes_parts).strip())
+
+        return result
+
+    # Run detective, mafia, and guardian simultaneously
+    _, killed, protected = await asyncio.gather(
+        _detective_action(),
+        _mafia_action(),
+        _guardian_action(),
+    )
+
+    # === Resolve guardian protection before doctor sees the result ===
+    if protected and killed == protected:
+        killed = None
+
+    # === PHASE 2: Doctor acts after seeing the post-guardian result ===
     doctors = state.get_by_role("doctor")
     doctor_saved = False
     poisoned = None
@@ -416,8 +501,7 @@ async def night_phase(
 
         notes_parts = [f"Night {round_id} Doctor Notes:\n"]
 
-        if parsed:
-            # Handle save
+        if isinstance(parsed, dict):
             if parsed.get("save") and state.doctor_has_save and killed:
                 doctor_saved = True
                 state.doctor_has_save = False
@@ -432,7 +516,6 @@ async def night_phase(
             # Handle poison
             poison_target = parsed.get("poison", "")
             if poison_target and state.doctor_has_poison:
-                # Validate: must be alive, not self, not the killed player
                 valid_poison = [
                     p for p in state.alive if p != doctor_name and p != killed
                 ]
@@ -459,71 +542,8 @@ async def night_phase(
         _distribute_transcript(str(notes_path), agent_dirs, [doctor_name])
         log_to_agent(agent_dirs[doctor_name], "\n".join(notes_parts).strip())
 
-    # If doctor saved the killed player, they survive (regardless of guardian)
+    # If doctor saved the killed player, they survive
     if doctor_saved and killed:
-        killed = None
-
-    # === GUARDIAN PHASE ===
-    guardians = state.get_by_role("guardian")
-    protected = None
-    if guardians:
-        guardian_name = guardians[0]
-        log_to_agent(
-            agent_dirs[guardian_name], f"--- Night {round_id}: Guardian Decision ---"
-        )
-
-        agent = agents[guardian_name]
-        context = _phase_context(state, "Night — Guardian Decision", guardian_name)
-        prompt = (
-            context
-            + "\n\n"
-            + guardian_prompt(
-                sorted(state.alive), guardian_name, state.guardian_last_protected
-            )
-        )
-        parsed = await _get_agent_json(
-            guardian_name,
-            agent,
-            prompt,
-            stream_callback=lambda text: stream_to_agent(
-                agent_dirs[guardian_name], text
-            ),
-            response_format=PROTECT_SCHEMA,
-        )
-
-        notes_parts = [f"Night {round_id} Guardian Notes:\n"]
-
-        if parsed and parsed.get("protect"):
-            protect_target = parsed["protect"]
-            # Validate: must be alive, not self, not same as last protected
-            valid_targets = [
-                p
-                for p in state.alive
-                if p != guardian_name and p != state.guardian_last_protected
-            ]
-            if protect_target in valid_targets:
-                protected = protect_target
-                state.guardian_last_protected = protected
-                notes_parts.append(f"You protected {protected} tonight.\n")
-            else:
-                notes_parts.append(
-                    f"Invalid target '{protect_target}'. No one was protected.\n"
-                )
-                state.guardian_last_protected = None
-
-            if parsed.get("reasoning"):
-                notes_parts.append(f"Reasoning: {parsed['reasoning']}\n")
-        else:
-            notes_parts.append("Decision failed (invalid response).\n")
-            state.guardian_last_protected = None
-
-        notes_path = data_dir / f"NIGHT_GUARDIAN_NOTES_{round_id}.txt"
-        notes_path.write_text("\n".join(notes_parts))
-        _distribute_transcript(str(notes_path), agent_dirs, [guardian_name])
-        log_to_agent(agent_dirs[guardian_name], "\n".join(notes_parts).strip())
-
-    # Resolve: if guardian protected the killed person, they survive
-    if protected and killed == protected:
         killed = None
 
     return killed, poisoned
@@ -538,6 +558,7 @@ async def day_phase(
     killed: str | None,
     poisoned: str | None,
     session_name: str,
+    use_llm_consensus: bool = False,
 ) -> tuple[str | None, list[str]]:
     """Run the day phase.
 
@@ -605,6 +626,7 @@ async def day_phase(
         log_callback=lambda name, msg: log_to_agent(agent_dirs[name], msg),
         stream_callback=lambda name, text: stream_to_agent(agent_dirs[name], text),
         first_speaker=state.mayor,
+        use_llm_consensus=use_llm_consensus,
     )
 
     # Vote

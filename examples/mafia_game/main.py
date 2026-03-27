@@ -10,7 +10,6 @@ Each agent directory must contain:
 
 import argparse
 import asyncio
-import logging
 import shutil
 import sys
 from pathlib import Path
@@ -35,7 +34,7 @@ from orchestrator import (
 )
 from tmux_utils import create_session, log_to_agent
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +83,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable tmux session creation",
     )
     parser.add_argument(
+        "--llm-consensus",
+        action="store_true",
+        help="Use LLM facilitator for consensus detection in addition to eagerness-based consensus",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -100,12 +104,13 @@ async def game_loop(
     mafia_rounds: int,
     day_rounds: int,
     session_name: str,
+    use_llm_consensus: bool = False,
 ) -> str:
     """Main game loop. Returns winner: 'village' or 'mafia'."""
 
     while True:
         state.round_id += 1
-        logger.info("========== ROUND %d ==========", state.round_id)
+        logger.info("========== ROUND {} ==========", state.round_id)
 
         for name in state.alive:
             log_to_agent(
@@ -113,18 +118,24 @@ async def game_loop(
             )
 
         # Night phase
-        logger.info("--- Night %d ---", state.round_id)
+        logger.info("--- Night {} ---", state.round_id)
         killed, poisoned = await night_phase(
-            state, agent_dirs, agents, facilitator, mafia_rounds, session_name
+            state,
+            agent_dirs,
+            agents,
+            facilitator,
+            mafia_rounds,
+            session_name,
+            use_llm_consensus=use_llm_consensus,
         )
 
         if killed:
-            logger.info("Mafia killed: %s", killed)
+            logger.info("Mafia killed: {}", killed)
         if poisoned:
-            logger.info("Doctor poisoned: %s", poisoned)
+            logger.info("Doctor poisoned: {}", poisoned)
 
         # Day phase
-        logger.info("--- Day %d ---", state.round_id)
+        logger.info("--- Day {} ---", state.round_id)
         eliminated, day_transcript_lines = await day_phase(
             state,
             agent_dirs,
@@ -134,10 +145,11 @@ async def game_loop(
             killed,
             poisoned,
             session_name,
+            use_llm_consensus=use_llm_consensus,
         )
 
         if eliminated:
-            logger.info("Voted out: %s (role: %s)", eliminated, state.roles[eliminated])
+            logger.info("Voted out: {} (role: {})", eliminated, state.roles[eliminated])
 
         # Check win condition
         winner = state.check_win()
@@ -149,7 +161,7 @@ async def game_loop(
         await diary_phase(state, agent_dirs, agents, day_transcript_lines)
 
         logger.info(
-            "Alive: %s",
+            "Alive: {}",
             ", ".join(f"{n} ({state.roles[n]})" for n in sorted(state.alive)),
         )
 
@@ -158,23 +170,21 @@ async def main():
     load_dotenv()
     args = parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    logger.remove()
+    logger.add(sys.stderr, level=args.log_level)
 
     # Validate agent directories
     agent_dirs: dict[str, str] = {}
     for d in args.agent_dirs:
         path = Path(d).resolve()
         if not path.is_dir():
-            logger.error("Agent directory not found: %s", d)
+            logger.error("Agent directory not found: {}", d)
             sys.exit(1)
         if not (path / "PERSONALITY.md").exists():
-            logger.error("Missing PERSONALITY.md in %s", d)
+            logger.error("Missing PERSONALITY.md in {}", d)
             sys.exit(1)
         if not (path / "MODEL.txt").exists():
-            logger.error("Missing MODEL.txt in %s", d)
+            logger.error("Missing MODEL.txt in {}", d)
             sys.exit(1)
         name = path.name
         agent_dirs[name] = str(path)
@@ -198,9 +208,9 @@ async def main():
     state.assign_roles()
 
     logger.info("=== MAFIA GAME ===")
-    logger.info("Players: %s", ", ".join(state.players))
+    logger.info("Players: {}", ", ".join(state.players))
     logger.info(
-        "Roles: %s",
+        "Roles: {}",
         ", ".join(f"{n}: {r}" for n, r in sorted(state.roles.items())),
     )
 
@@ -208,7 +218,7 @@ async def main():
     if not args.no_tmux:
         create_session(args.session_name, agent_dirs)
         logger.info(
-            "Tmux session '%s' created. Attach with: tmux attach -t %s",
+            "Tmux session '{}' created. Attach with: tmux attach -t {}",
             args.session_name,
             args.session_name,
         )
@@ -232,6 +242,7 @@ async def main():
         facilitator=facilitator,
         mayor_rounds=args.mayor_rounds,
         session_name=args.session_name,
+        use_llm_consensus=args.llm_consensus,
     )
 
     # Day 0: Diary
@@ -247,15 +258,16 @@ async def main():
         mafia_rounds=args.mafia_rounds,
         day_rounds=args.day_rounds,
         session_name=args.session_name,
+        use_llm_consensus=args.llm_consensus,
     )
 
     # Print results
     logger.info("=== GAME OVER ===")
-    logger.info("Winner: %s", "Village" if winner == "village" else "Mafia")
+    logger.info("Winner: {}", "Village" if winner == "village" else "Mafia")
     logger.info("Final roles:")
     for name in state.players:
         status = "ALIVE" if name in state.alive else "DEAD"
-        logger.info("  %s: %s (%s)", name, state.roles[name], status)
+        logger.info("  {}: {} ({})", name, state.roles[name], status)
 
     for name in state.alive:
         log_to_agent(
