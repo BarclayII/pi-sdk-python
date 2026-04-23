@@ -24,6 +24,7 @@ from pi_sdk import Agent
 
 from agent_factory import build_all_agents, build_facilitator
 from game_state import GameState
+from i18n import role_name, set_lang, t, winner_label
 from orchestrator import (
     day_phase,
     diary_phase,
@@ -43,6 +44,12 @@ def parse_args() -> argparse.Namespace:
         "agent_dirs",
         nargs="+",
         help="Paths to agent directories (each with PERSONALITY.md and MODEL.txt)",
+    )
+    parser.add_argument(
+        "--lang",
+        default="en",
+        choices=["en", "cn"],
+        help="Game language: en (English) or cn (Chinese/中文) (default: en)",
     )
     parser.add_argument(
         "--mayor-rounds",
@@ -110,15 +117,13 @@ async def game_loop(
 
     while True:
         state.round_id += 1
-        logger.info("========== ROUND {} ==========", state.round_id)
+        logger.info(t("round", state.round_id))
 
         for name in state.alive:
-            log_to_agent(
-                agent_dirs[name], f"========== ROUND {state.round_id} =========="
-            )
+            log_to_agent(agent_dirs[name], t("round", state.round_id))
 
         # Night phase
-        logger.info("--- Night {} ---", state.round_id)
+        logger.info(t("night", state.round_id))
         killed, poisoned = await night_phase(
             state,
             agent_dirs,
@@ -130,12 +135,12 @@ async def game_loop(
         )
 
         if killed:
-            logger.info("Mafia killed: {}", killed)
+            logger.info(t("mafia_killed", killed))
         if poisoned:
-            logger.info("Doctor poisoned: {}", poisoned)
+            logger.info(t("doctor_poisoned", poisoned))
 
         # Day phase
-        logger.info("--- Day {} ---", state.round_id)
+        logger.info(t("day", state.round_id))
         eliminated, day_transcript_lines = await day_phase(
             state,
             agent_dirs,
@@ -149,7 +154,7 @@ async def game_loop(
         )
 
         if eliminated:
-            logger.info("Voted out: {} (role: {})", eliminated, state.roles[eliminated])
+            logger.info(t("voted_out", eliminated, role_name(state.roles[eliminated])))
 
         # Check win condition
         winner = state.check_win()
@@ -157,18 +162,25 @@ async def game_loop(
             return winner
 
         # Diary phase
-        logger.info("--- Diary phase ---")
+        logger.info(t("diary_phase"))
         await diary_phase(state, agent_dirs, agents, day_transcript_lines)
 
         logger.info(
-            "Alive: {}",
-            ", ".join(f"{n} ({state.roles[n]})" for n in sorted(state.alive)),
+            t(
+                "alive",
+                ", ".join(
+                    f"{n} ({role_name(state.roles[n])})" for n in sorted(state.alive)
+                ),
+            ),
         )
 
 
 async def main():
     load_dotenv()
     args = parse_args()
+
+    # Set language before anything else
+    set_lang(args.lang)
 
     logger.remove()
     logger.add(sys.stderr, level=args.log_level)
@@ -190,7 +202,7 @@ async def main():
         agent_dirs[name] = str(path)
 
     if len(agent_dirs) < 5:
-        logger.error("Need at least 5 agents to play Mafia.")
+        logger.error(t("need_5_agents"))
         sys.exit(1)
 
     # Create data directories for each agent and distribute RULES.md
@@ -207,11 +219,13 @@ async def main():
     )
     state.assign_roles()
 
-    logger.info("=== MAFIA GAME ===")
-    logger.info("Players: {}", ", ".join(state.players))
+    logger.info(t("mafia_game_title"))
+    logger.info(t("players", ", ".join(state.players)))
     logger.info(
-        "Roles: {}",
-        ", ".join(f"{n}: {r}" for n, r in sorted(state.roles.items())),
+        t(
+            "roles",
+            ", ".join(f"{n}: {role_name(r)}" for n, r in sorted(state.roles.items())),
+        ),
     )
 
     # Setup tmux
@@ -226,7 +240,7 @@ async def main():
     # Log each player's assigned role to their activity.log
     for name, agent_dir in agent_dirs.items():
         role = state.roles[name]
-        log_to_agent(agent_dir, f"=== Role assigned: {role.upper()} ===")
+        log_to_agent(agent_dir, t("role_assigned", role_name(role)))
 
     # Build facilitator
     facilitator = build_facilitator(args.facilitator_model)
@@ -246,7 +260,7 @@ async def main():
     )
 
     # Day 0: Diary
-    logger.info("--- Day 0 Diary phase ---")
+    logger.info(t("day0_diary_phase"))
     await mayor_election_diary_phase(state, agent_dirs, agents)
 
     # Run game
@@ -262,17 +276,17 @@ async def main():
     )
 
     # Print results
-    logger.info("=== GAME OVER ===")
-    logger.info("Winner: {}", "Village" if winner == "village" else "Mafia")
-    logger.info("Final roles:")
+    logger.info(t("game_over"))
+    logger.info(t("winner", winner_label(winner)))
+    logger.info(t("final_roles"))
     for name in state.players:
-        status = "ALIVE" if name in state.alive else "DEAD"
-        logger.info("  {}: {} ({})", name, state.roles[name], status)
+        status = t("status_alive") if name in state.alive else t("status_dead")
+        logger.info("  {}: {} ({})", name, role_name(state.roles[name]), status)
 
     for name in state.alive:
         log_to_agent(
             agent_dirs[name],
-            f"=== GAME OVER - {'Village' if winner == 'village' else 'Mafia'} wins! ===",
+            t("game_over_winner", winner_label(winner)),
         )
 
     # Post-game reflection: agents summarize, update knowledge, and write lessons learned

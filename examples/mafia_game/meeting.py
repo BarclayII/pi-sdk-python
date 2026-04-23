@@ -17,6 +17,7 @@ from pi_sdk import (
     UserMessage,
 )
 
+from i18n import get_lang, t
 from prompts import (
     consensus_prompt,
     eagerness_prompt,
@@ -290,17 +291,26 @@ async def poll_eagerness(
     async def _poll_one(name: str, agent: Agent) -> tuple[str, float]:
         if name not in initialized:
             # First poll: full meeting context + transcript
-            transcript_so_far = (
-                "\n".join(transcript_lines)
-                if transcript_lines
-                else "(meeting just started)"
-            )
-            context = (
-                f"{meeting_context}\n\nMeeting transcript so far:\n{transcript_so_far}"
-            )
+            if get_lang() == "cn":
+                transcript_so_far = (
+                    "\n".join(transcript_lines)
+                    if transcript_lines
+                    else "（会议刚开始）"
+                )
+                context = f"{meeting_context}\n\n目前的会议记录:\n{transcript_so_far}"
+            else:
+                transcript_so_far = (
+                    "\n".join(transcript_lines)
+                    if transcript_lines
+                    else "(meeting just started)"
+                )
+                context = f"{meeting_context}\n\nMeeting transcript so far:\n{transcript_so_far}"
         else:
             # Subsequent poll: only the latest speech
-            context = latest_speech or "(no new messages)"
+            if get_lang() == "cn":
+                context = latest_speech or "（无新消息）"
+            else:
+                context = latest_speech or "(no new messages)"
 
         prompt = eagerness_prompt(context)
         per_player_stream = (
@@ -411,7 +421,7 @@ async def run_meeting(
     latest_speech: str | None = None
 
     with open(transcript_path, "w") as f:
-        f.write(f"=== Meeting Transcript ===\n\n")
+        f.write(f"{t('meeting_transcript')}\n\n")
 
     for round_num in range(max_rounds):
         # Force first_speaker for round 0 if set and alive
@@ -445,9 +455,9 @@ async def run_meeting(
 
             # Eagerness-based consensus: if everyone's eagerness is negative,
             # end the meeting (players have nothing more to say)
-            if transcript_lines and all(v <= 0 for v in eagerness.values()):
+            if transcript_lines and all(v <= 3 for v in eagerness.values()):
                 logger.info(
-                    "Eagerness consensus at round {}: all players' eagerness is nonpositive, ending meeting",
+                    "Eagerness consensus at round {}: all players' eagerness is small, ending meeting",
                     round_num + 1,
                 )
                 break
@@ -468,12 +478,25 @@ async def run_meeting(
         # Just tell them it's their turn to speak.
         if speaker not in initialized:
             # First speaker in round 0 with forced speaker — needs full context
-            transcript_so_far = (
-                "\n".join(transcript_lines)
-                if transcript_lines
-                else "(meeting just started)"
-            )
-            prompt = f"""{meeting_context}
+            if get_lang() == "cn":
+                transcript_so_far = (
+                    "\n".join(transcript_lines)
+                    if transcript_lines
+                    else "（会议刚开始）"
+                )
+                prompt = f"""{meeting_context}
+
+目前的会议记录:
+{transcript_so_far}
+
+轮到你发言了。请保持简洁，2-4句话。"""
+            else:
+                transcript_so_far = (
+                    "\n".join(transcript_lines)
+                    if transcript_lines
+                    else "(meeting just started)"
+                )
+                prompt = f"""{meeting_context}
 
 Meeting transcript so far:
 {transcript_so_far}
@@ -481,7 +504,10 @@ Meeting transcript so far:
 It's your turn to speak. Keep your response to 2-4 sentences."""
             initialized.add(speaker)
         else:
-            prompt = "It's your turn to speak. Keep your response to 2-4 sentences."
+            if get_lang() == "cn":
+                prompt = "轮到你发言了。请保持简洁，2-4句话。"
+            else:
+                prompt = "It's your turn to speak. Keep your response to 2-4 sentences."
 
         # Get agent response
         agent = participants[speaker]
@@ -509,11 +535,18 @@ It's your turn to speak. Keep your response to 2-4 sentences."""
                 round_num + 1,
                 speaker,
             )
-            retry_prompt = (
-                f"{prompt}\n\n"
-                f"IMPORTANT: You ARE {speaker}. Speak in first person. "
-                f"Do not refer to yourself by name or in the third person."
-            )
+            if get_lang() == "cn":
+                retry_prompt = (
+                    f"{prompt}\n\n"
+                    f"重要：你就是 {speaker}。请用第一人称说话。"
+                    f"不要用自己的名字或第三人称称呼自己。"
+                )
+            else:
+                retry_prompt = (
+                    f"{prompt}\n\n"
+                    f"IMPORTANT: You ARE {speaker}. Speak in first person. "
+                    f"Do not refer to yourself by name or in the third person."
+                )
             response = await _get_agent_response(
                 speaker, agent, retry_prompt, stream_callback=per_speaker_stream
             )

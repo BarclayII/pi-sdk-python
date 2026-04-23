@@ -10,6 +10,7 @@ from roles import (
     GUARDIAN_DESCRIPTION,
     MAFIA_DESCRIPTION,
     VILLAGER_DESCRIPTION,
+    ROLE_DESCRIPTION_GETTERS,
 )
 
 
@@ -61,8 +62,11 @@ class GameState:
     }
 
     def get_role_description(self, name: str) -> str:
-        """Get the role description text for a player."""
+        """Get the role description text for a player (language-aware)."""
         role = self.roles[name]
+        getter = ROLE_DESCRIPTION_GETTERS.get(role)
+        if getter:
+            return getter()
         return self.ROLE_DESCRIPTIONS[role]
 
     def get_by_role(self, role: str) -> list[str]:
