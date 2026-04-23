@@ -3,9 +3,9 @@
 Usage:
     from i18n import set_lang, t, role_name
 
-    set_lang("cn")           # switch to Chinese
-    t("game_over")           # "=== 游戏结束 ==="
-    role_name("mafia")       # "狼人"
+    set_lang("cn")                        # switch to Chinese
+    t("killed_by_mafia", "alice", "mafia")  # interpolated string
+    role_name("mafia")                     # "狼人"
 """
 
 _lang: str = "en"
@@ -67,151 +67,14 @@ def winner_label(winner: str) -> str:
 # Translation strings
 # ---------------------------------------------------------------------------
 _STRINGS = {
-    # --- main.py ---
-    "mafia_game_title": {
-        "en": "=== MAFIA GAME ===",
-        "cn": "=== 狼人杀 ===",
-    },
-    "players": {
-        "en": "Players: {}",
-        "cn": "玩家: {}",
-    },
-    "roles": {
-        "en": "Roles: {}",
-        "cn": "角色: {}",
-    },
-    "role_assigned": {
-        "en": "=== Role assigned: {} ===",
-        "cn": "=== 分配角色: {} ===",
-    },
-    "round": {
-        "en": "========== ROUND {} ==========",
-        "cn": "========== 第 {} 轮 ==========",
-    },
-    "night": {
-        "en": "--- Night {} ---",
-        "cn": "--- 第 {} 夜 ---",
-    },
-    "day": {
-        "en": "--- Day {} ---",
-        "cn": "--- 第 {} 天 ---",
-    },
-    "mafia_killed": {
-        "en": "Mafia killed: {}",
-        "cn": "狼人击杀: {}",
-    },
-    "doctor_poisoned": {
-        "en": "Doctor poisoned: {}",
-        "cn": "女巫毒杀: {}",
-    },
-    "voted_out": {
-        "en": "Voted out: {} (role: {})",
-        "cn": "投票出局: {} (角色: {})",
-    },
-    "diary_phase": {
-        "en": "--- Diary phase ---",
-        "cn": "--- 日记阶段 ---",
-    },
-    "alive": {
-        "en": "Alive: {}",
-        "cn": "存活: {}",
-    },
-    "game_over": {
-        "en": "=== GAME OVER ===",
-        "cn": "=== 游戏结束 ===",
-    },
-    "winner": {
-        "en": "Winner: {}",
-        "cn": "获胜方: {}",
-    },
-    "final_roles": {
-        "en": "Final roles:",
-        "cn": "最终角色:",
-    },
-    "status_alive": {
-        "en": "ALIVE",
-        "cn": "存活",
-    },
-    "status_dead": {
-        "en": "DEAD",
-        "cn": "死亡",
-    },
-    "game_over_winner": {
-        "en": "=== GAME OVER - {} wins! ===",
-        "cn": "=== 游戏结束 - {} 获胜! ===",
-    },
-    "day0_diary_phase": {
-        "en": "--- Day 0 Diary phase ---",
-        "cn": "--- 第0天日记阶段 ---",
-    },
-    "need_5_agents": {
-        "en": "Need at least 5 agents to play Mafia.",
-        "cn": "至少需要5个玩家才能进行狼人杀游戏。",
-    },
     # --- orchestrator.py ---
-    "day0_mayor_election": {
-        "en": "--- Day 0: Mayor Election ---",
-        "cn": "--- 第0天: 警长竞选 ---",
-    },
     "mayor_vote": {
         "en": "--- MAYOR VOTE ---",
         "cn": "--- 警长投票 ---",
     },
-    "mayor_elected": {
-        "en": "Mayor elected: {}",
-        "cn": "当选警长: {}",
-    },
-    "mayor_tie_random": {
-        "en": "Mayor tie — randomly selected: {}",
-        "cn": "警长票数持平 — 随机选出: {}",
-    },
-    "mayor_elected_tiebreak": {
-        "en": "Mayor elected (tiebreak): {}",
-        "cn": "当选警长 (决胜): {}",
-    },
-    "writing_diary_day0": {
-        "en": "--- Writing diary for Day 0 ---",
-        "cn": "--- 撰写第0天日记 ---",
-    },
-    "diary_written": {
-        "en": "Diary written.",
-        "cn": "日记已写完。",
-    },
     "mayor_dying_successor": {
         "en": "Mayor {} is dying — appointing successor",
         "cn": "警长 {} 即将死亡 — 正在指定继任者",
-    },
-    "new_mayor_appointed": {
-        "en": "The dying Mayor {} appointed {} as the new Mayor.",
-        "cn": "即将死亡的警长 {} 指定 {} 为新任警长。",
-    },
-    "mayor_succession_fallback": {
-        "en": "The Mayor's last wish was unclear. {} becomes the new Mayor.",
-        "cn": "警长的遗言不明。{} 成为新任警长。",
-    },
-    "night_investigation": {
-        "en": "--- Night {}: Investigation ---",
-        "cn": "--- 第{}夜: 预言家查验 ---",
-    },
-    "night_mafia_meeting": {
-        "en": "--- Night {}: Mafia Meeting ---",
-        "cn": "--- 第{}夜: 狼人会议 ---",
-    },
-    "night_guardian_decision": {
-        "en": "--- Night {}: Guardian Decision ---",
-        "cn": "--- 第{}夜: 守卫守护 ---",
-    },
-    "night_doctor_decision": {
-        "en": "--- Night {}: Doctor Decision ---",
-        "cn": "--- 第{}夜: 女巫行动 ---",
-    },
-    "mafia_target": {
-        "en": "Mafia target: {}",
-        "cn": "狼人目标: {}",
-    },
-    "mafia_target_none": {
-        "en": "Mafia target: no one",
-        "cn": "狼人目标: 无",
     },
     "killed_by_mafia": {
         "en": "{} was killed by the Mafia during the night. Their role was: {}.",
@@ -229,29 +92,17 @@ _STRINGS = {
         "en": "--- VOTING ---",
         "cn": "--- 投票 ---",
     },
-    "voted_out_announcement": {
-        "en": "{} was voted out. Their role was: {}.",
-        "cn": "{} 被投票出局。其角色为: {}。",
+    "guardian_saved": {
+        "en": "Guardian saved {} from the Mafia!",
+        "cn": "守卫救下了 {}，使其免于狼人毒手！",
     },
-    "writing_diary_round": {
-        "en": "--- Writing diary for round {} ---",
-        "cn": "--- 撰写第{}轮日记 ---",
+    "doctor_saved": {
+        "en": "Doctor revived {}!",
+        "cn": "女巫救活了 {}！",
     },
     "no_day_meeting": {
         "en": "(no day meeting this round)",
         "cn": "(本轮无白天会议)",
-    },
-    "postgame_reflection": {
-        "en": "--- Post-game reflection phase ---",
-        "cn": "--- 赛后反思阶段 ---",
-    },
-    "postgame_reflection_agent": {
-        "en": "--- Post-game reflection ---",
-        "cn": "--- 赛后反思 ---",
-    },
-    "postgame_reflection_complete": {
-        "en": "Post-game reflection complete.",
-        "cn": "赛后反思完成。",
     },
     "eliminated_result": {
         "en": "Eliminated: {}. Their role was: {}.",

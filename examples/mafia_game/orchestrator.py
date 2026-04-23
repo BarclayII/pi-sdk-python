@@ -7,10 +7,20 @@ import random
 import shutil
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from pi_sdk import Agent
 
+from event_bus import EventBus
+from events import (
+    Death,
+    DiaryEntry,
+    MayorElected,
+    NightAction,
+    PhaseChange,
+    PostgameReflection,
+    SystemMessage,
+    player_channel,
+)
 from game_state import GameState
 from i18n import get_lang, role_name, t
 from meeting import (
@@ -30,61 +40,15 @@ from prompts import (
     postgame_prompt,
 )
 from roles import (
+    DOCTOR_ACTION_SCHEMA,
     INVESTIGATE_SCHEMA,
     PROTECT_SCHEMA,
-    DOCTOR_ACTION_SCHEMA,
     detective_prompt,
-    guardian_prompt,
     doctor_prompt,
+    guardian_prompt,
 )
-from tmux_utils import log_to_agent, mark_agent_dead, stream_to_agent
 
 from loguru import logger
-
-if TYPE_CHECKING:
-    from web_events import GameEventBus
-
-
-def _emit(event_bus: GameEventBus | None, coro):
-    """Fire-and-forget an event_bus coroutine if event_bus is present."""
-    if event_bus is not None:
-        asyncio.ensure_future(coro)
-
-
-def _make_dual_stream(agent_dirs: dict[str, str], event_bus: GameEventBus | None):
-    """Create a stream callback that sends to both tmux and web event bus.
-
-    Returns a (name, text) callback suitable for run_meeting/run_vote.
-    """
-
-    def callback(name: str, text: str):
-        stream_to_agent(agent_dirs[name], text)
-        if event_bus is not None:
-            asyncio.ensure_future(event_bus.emit_speech_chunk(name, text))
-
-    return callback
-
-
-def _make_dual_stream_single(agent_dir: str, name: str, event_bus: GameEventBus | None):
-    """Create a stream callback for a single agent (tmux + web)."""
-
-    def callback(text: str):
-        stream_to_agent(agent_dir, text)
-        if event_bus is not None:
-            asyncio.ensure_future(event_bus.emit_speech_chunk(name, text))
-
-    return callback
-
-
-def _make_dual_log(agent_dirs: dict[str, str], event_bus: GameEventBus | None):
-    """Create a log callback that sends to both tmux and web event bus."""
-
-    def callback(name: str, msg: str):
-        log_to_agent(agent_dirs[name], msg)
-        if event_bus is not None:
-            asyncio.ensure_future(event_bus.emit_system_message(f"[{name}] {msg}"))
-
-    return callback
 
 
 def _distribute_transcript(
@@ -102,12 +66,10 @@ def _distribute_transcript(
 
 
 def _get_dead_players(state: GameState) -> list[str]:
-    """Get list of dead players."""
     return [p for p in state.players if p not in state.alive]
 
 
 def _get_mafia_allies_alive(state: GameState, name: str) -> list[str] | None:
-    """Get alive mafia allies for a player, or None if not mafia."""
     if state.roles.get(name) != "mafia":
         return None
     return [m for m in state.get_by_role("mafia") if m != name]
@@ -118,7 +80,6 @@ def _phase_context(
     phase: str,
     name: str | None = None,
 ) -> str:
-    """Build phase context prompt, optionally including mafia allies for a specific player."""
     mafia_allies_alive = None
     if name and state.roles.get(name) == "mafia":
         mafia_allies_alive = _get_mafia_allies_alive(state, name)
@@ -133,33 +94,32 @@ def _phase_context(
     )
 
 
+def _emit_phase(bus: EventBus, state: GameState, phase: str) -> None:
+    bus.emit(
+        PhaseChange(
+            phase=phase,
+            round_id=state.round_id,
+            alive=sorted(state.alive),
+            dead=_get_dead_players(state),
+            mayor=state.mayor,
+        )
+    )
+
+
 async def mayor_election_phase(
     state: GameState,
     agent_dirs: dict[str, str],
     agents: dict[str, Agent],
     facilitator: Agent,
     mayor_rounds: int,
-    session_name: str,
+    bus: EventBus,
     use_llm_consensus: bool = False,
-    event_bus: GameEventBus | None = None,
 ) -> None:
     """Run the Day 0 mayor election: discussion + vote."""
     data_dir = Path(state.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(t("day0_mayor_election"))
-    for name in state.alive:
-        log_to_agent(agent_dirs[name], t("day0_mayor_election"))
-
-    if event_bus:
-        await event_bus.emit_phase_change(
-            "mayor_election",
-            0,
-            sorted(state.alive),
-            _get_dead_players(state),
-            state.mayor,
-        )
-        await event_bus.emit_system_message(t("day0_mayor_election"))
+    _emit_phase(bus, state, "mayor_election")
 
     alive_agents = {name: agents[name] for name in state.alive}
     transcript_path = str(data_dir / "DAY_0_MAYOR_ELECTION.txt")
@@ -172,27 +132,20 @@ async def mayor_election_phase(
         transcript_path=transcript_path,
         max_rounds=mayor_rounds,
         meeting_context=meeting_context,
-        log_callback=_make_dual_log(agent_dirs, event_bus),
-        stream_callback=_make_dual_stream(agent_dirs, event_bus),
+        bus=bus,
+        meeting_channel="public",
         use_llm_consensus=use_llm_consensus,
     )
 
-    # Vote for mayor (simple plurality, can vote for self)
-    for name in state.alive:
-        log_to_agent(agent_dirs[name], t("mayor_vote"))
+    bus.emit(SystemMessage(text=t("mayor_vote")))
 
     winner, vote_results = await run_vote(
         participants=alive_agents,
         vote_type="mayor",
-        stream_callback=_make_dual_stream(agent_dirs, event_bus),
+        bus=bus,
+        channel="public",
     )
 
-    # Emit votes to web
-    if event_bus:
-        for voter, data in vote_results.items():
-            await event_bus.emit_vote(voter, data["vote"], data.get("reasoning", ""))
-
-    # Append vote results to transcript
     with open(transcript_path, "a") as f:
         f.write(f"\n{t('mayor_vote_header')}\n")
         for voter, data in vote_results.items():
@@ -204,11 +157,8 @@ async def mayor_election_phase(
 
     if winner:
         state.mayor = winner
-        logger.info(t("mayor_elected", winner))
-        for name in state.alive:
-            log_to_agent(agent_dirs[name], t("mayor_elected", winner))
+        bus.emit(MayorElected(name=winner, via="vote"))
     else:
-        # Tie — pick randomly from tied candidates
         tally = Counter(
             d["vote"] for d in vote_results.values() if d["vote"] != "abstain"
         )
@@ -216,15 +166,8 @@ async def mayor_election_phase(
             max_count = max(tally.values())
             tied = [n for n, c in tally.items() if c == max_count]
             state.mayor = random.choice(tied)
-            logger.info(t("mayor_tie_random", state.mayor))
-            for name in state.alive:
-                log_to_agent(agent_dirs[name], t("mayor_elected_tiebreak", state.mayor))
+            bus.emit(MayorElected(name=state.mayor, via="tiebreak_random"))
 
-    if event_bus and state.mayor:
-        await event_bus.emit_mayor_elected(state.mayor)
-        await event_bus.emit_vote_result("mayor", state.mayor)
-
-    # Distribute transcript to all players
     _distribute_transcript(transcript_path, agent_dirs, state.players)
 
 
@@ -232,7 +175,7 @@ async def mayor_election_diary_phase(
     state: GameState,
     agent_dirs: dict[str, str],
     agents: dict[str, Agent],
-    event_bus: GameEventBus | None = None,
+    bus: EventBus,
 ) -> None:
     """Have all agents write a Day 0 diary after the mayor election."""
     data_dir = Path(state.data_dir)
@@ -243,29 +186,26 @@ async def mayor_election_diary_phase(
 
     alive_sorted = sorted(state.alive)
 
-    if event_bus:
-        await event_bus.emit_phase_change(
-            "diary", 0, sorted(state.alive), _get_dead_players(state), state.mayor
-        )
+    _emit_phase(bus, state, "diary")
 
     async def _write_diary(name: str) -> None:
-        log_to_agent(agent_dirs[name], t("writing_diary_day0"))
         prompt = mayor_election_diary_prompt(name, alive_sorted, election_transcript)
-
-        def _stream(text: str, n: str = name) -> None:
-            stream_to_agent(agent_dirs[n], text)
-            if event_bus is not None:
-                asyncio.ensure_future(event_bus.emit_diary_chunk(n, text))
-
         text = await _get_agent_response(
             name,
             agents[name],
             prompt,
-            stream_callback=_stream,
+            bus=bus,
+            channel=player_channel(name),
+            context="diary",
         )
-        log_to_agent(agent_dirs[name], t("diary_written"))
-        if event_bus:
-            await event_bus.emit_diary_entry(name, text)
+        bus.emit(
+            DiaryEntry(
+                channel=player_channel(name),
+                name=name,
+                round_id=0,
+                text=text,
+            )
+        )
 
     eligible = [n for n in sorted(state.players) if n in agent_dirs and n in agents]
     await asyncio.gather(*(_write_diary(n) for n in eligible))
@@ -273,11 +213,9 @@ async def mayor_election_diary_phase(
 
 async def _handle_mayor_succession(
     state: GameState,
-    agent_dirs: dict[str, str],
     agents: dict[str, Agent],
     dead_player: str,
-    session_name: str,
-    event_bus: GameEventBus | None = None,
+    bus: EventBus,
 ) -> None:
     """If the dead player is the mayor, have them appoint a successor."""
     if state.mayor != dead_player:
@@ -288,18 +226,17 @@ async def _handle_mayor_succession(
         state.mayor = None
         return
 
-    logger.info(t("mayor_dying_successor", dead_player))
+    bus.emit(SystemMessage(text=t("mayor_dying_successor", dead_player)))
 
-    # Ask the dying mayor to appoint a successor (they're still in agents dict)
     if dead_player in agents:
         prompt = mayor_succession_prompt(dead_player, alive_list)
         parsed = await _get_agent_json(
             dead_player,
             agents[dead_player],
             prompt,
-            stream_callback=_make_dual_stream_single(
-                agent_dirs[dead_player], dead_player, event_bus
-            ),
+            bus=bus,
+            channel=player_channel(dead_player),
+            context="vote",
             response_format=VOTE_SCHEMA,
         )
 
@@ -309,26 +246,11 @@ async def _handle_mayor_succession(
             and parsed["vote"] != dead_player
         ):
             state.mayor = parsed["vote"]
-            logger.info("New mayor appointed: {}", state.mayor)
-            for name in state.alive:
-                log_to_agent(
-                    agent_dirs[name],
-                    t("new_mayor_appointed", dead_player, state.mayor),
-                )
-            if event_bus:
-                await event_bus.emit_mayor_elected(state.mayor)
+            bus.emit(MayorElected(name=state.mayor, via="succession"))
             return
 
-    # Fallback: if parsing fails or invalid, pick the first alive player
     state.mayor = alive_list[0]
-    logger.info("Mayor succession fallback: {}", state.mayor)
-    for name in state.alive:
-        log_to_agent(
-            agent_dirs[name],
-            t("mayor_succession_fallback", state.mayor),
-        )
-    if event_bus:
-        await event_bus.emit_mayor_elected(state.mayor)
+    bus.emit(MayorElected(name=state.mayor, via="succession_fallback"))
 
 
 async def night_phase(
@@ -337,9 +259,8 @@ async def night_phase(
     agents: dict[str, Agent],
     facilitator: Agent,
     mafia_rounds: int,
-    session_name: str,
+    bus: EventBus,
     use_llm_consensus: bool = False,
-    event_bus: GameEventBus | None = None,
 ) -> tuple[str | None, str | None]:
     """Run the night phase.
 
@@ -350,25 +271,16 @@ async def night_phase(
     data_dir.mkdir(parents=True, exist_ok=True)
     round_id = state.round_id
 
-    if event_bus:
-        await event_bus.emit_phase_change(
-            "night",
-            round_id,
-            sorted(state.alive),
-            _get_dead_players(state),
-            state.mayor,
-        )
+    _emit_phase(bus, state, "night")
 
     # === PHASE 1: Detective, Mafia, and Guardian act simultaneously ===
-    killed = None
-    protected = None
 
     async def _detective_action() -> None:
         detectives = state.get_by_role("detective")
         if not detectives:
             return
         detective = detectives[0]
-        log_to_agent(agent_dirs[detective], t("night_investigation", round_id))
+        channel = player_channel(detective)
 
         agent = agents[detective]
         phase_label = (
@@ -380,9 +292,9 @@ async def night_phase(
             detective,
             agent,
             prompt,
-            stream_callback=_make_dual_stream_single(
-                agent_dirs[detective], detective, event_bus
-            ),
+            bus=bus,
+            channel=channel,
+            context="night_action",
             response_format=INVESTIGATE_SCHEMA,
         )
 
@@ -399,33 +311,37 @@ async def night_phase(
                 f"{t('you_investigated', investigated)}\n"
                 f"{t('investigation_result_mafia', investigated) if is_mafia else t('investigation_result_not_mafia', investigated)}\n"
             )
-            if event_bus:
-                await event_bus.emit_night_action(
-                    "detective",
-                    detective,
-                    "investigate",
-                    investigated,
-                    "mafia" if is_mafia else "not_mafia",
+            bus.emit(
+                NightAction(
+                    channel=channel,
+                    role="detective",
+                    actor=detective,
+                    action="investigate",
+                    target=investigated,
+                    outcome="mafia" if is_mafia else "not_mafia",
                 )
+            )
         else:
             result_text = t("investigation_failed", round_id) + "\n"
-            if event_bus:
-                await event_bus.emit_night_action(
-                    "detective", detective, "investigate", None, "failed"
+            bus.emit(
+                NightAction(
+                    channel=channel,
+                    role="detective",
+                    actor=detective,
+                    action="investigate",
+                    target=None,
+                    outcome="failed",
                 )
+            )
 
         notes_path = data_dir / f"NIGHT_DETECTIVE_NOTES_{round_id}.txt"
         notes_path.write_text(result_text)
         _distribute_transcript(str(notes_path), agent_dirs, [detective])
-        log_to_agent(agent_dirs[detective], result_text.strip())
 
     async def _mafia_action() -> str | None:
         mafia_members = state.get_by_role("mafia")
         if not mafia_members:
             return None
-
-        for m in mafia_members:
-            log_to_agent(agent_dirs[m], t("night_mafia_meeting", round_id))
 
         transcript_path = str(data_dir / f"NIGHT_MAFIA_{round_id}.txt")
         target = None
@@ -463,9 +379,9 @@ async def night_phase(
                 mafia_name,
                 agent,
                 prompt,
-                stream_callback=_make_dual_stream_single(
-                    agent_dirs[mafia_name], mafia_name, event_bus
-                ),
+                bus=bus,
+                channel=player_channel(mafia_name),
+                context="night_action",
                 response_format=VOTE_SCHEMA,
             )
 
@@ -510,8 +426,8 @@ async def night_phase(
                 transcript_path=transcript_path,
                 max_rounds=mafia_rounds,
                 meeting_context=meeting_context,
-                log_callback=_make_dual_log(agent_dirs, event_bus),
-                stream_callback=_make_dual_stream(agent_dirs, event_bus),
+                bus=bus,
+                meeting_channel="mafia",
                 use_llm_consensus=use_llm_consensus,
             )
 
@@ -520,7 +436,8 @@ async def night_phase(
                 participants=mafia_agents,
                 vote_type="kill",
                 valid_targets=all_targets,
-                stream_callback=_make_dual_stream(agent_dirs, event_bus),
+                bus=bus,
+                channel="mafia",
             )
 
             with open(transcript_path, "a") as f:
@@ -534,21 +451,16 @@ async def night_phase(
 
         _distribute_transcript(transcript_path, agent_dirs, mafia_members)
 
-        for m in mafia_members:
-            if target:
-                log_to_agent(agent_dirs[m], t("mafia_target", target))
-            else:
-                log_to_agent(agent_dirs[m], t("mafia_target_none"))
-
-        if event_bus:
-            if target:
-                await event_bus.emit_night_action(
-                    "mafia", ", ".join(mafia_members), "kill", target, "targeted"
-                )
-            else:
-                await event_bus.emit_night_action(
-                    "mafia", ", ".join(mafia_members), "kill", None, "no_kill"
-                )
+        bus.emit(
+            NightAction(
+                channel="mafia",
+                role="mafia",
+                actor="mafia",
+                action="kill",
+                target=target,
+                outcome="targeted" if target else "no_kill",
+            )
+        )
 
         return target
 
@@ -558,7 +470,7 @@ async def night_phase(
             return None
 
         guardian_name = guardians[0]
-        log_to_agent(agent_dirs[guardian_name], t("night_guardian_decision", round_id))
+        channel = player_channel(guardian_name)
 
         agent = agents[guardian_name]
         phase_label = (
@@ -576,9 +488,9 @@ async def night_phase(
             guardian_name,
             agent,
             prompt,
-            stream_callback=_make_dual_stream_single(
-                agent_dirs[guardian_name], guardian_name, event_bus
-            ),
+            bus=bus,
+            channel=channel,
+            context="night_action",
             response_format=PROTECT_SCHEMA,
         )
 
@@ -615,33 +527,36 @@ async def night_phase(
         notes_path = data_dir / f"NIGHT_GUARDIAN_NOTES_{round_id}.txt"
         notes_path.write_text("\n".join(notes_parts))
         _distribute_transcript(str(notes_path), agent_dirs, [guardian_name])
-        log_to_agent(agent_dirs[guardian_name], "\n".join(notes_parts).strip())
 
-        if event_bus:
-            if result:
-                await event_bus.emit_night_action(
-                    "guardian", guardian_name, "protect", result, "protected"
-                )
-            else:
-                await event_bus.emit_night_action(
-                    "guardian", guardian_name, "protect", None, "failed"
-                )
+        bus.emit(
+            NightAction(
+                channel=channel,
+                role="guardian",
+                actor=guardian_name,
+                action="protect",
+                target=result,
+                outcome="protected" if result else "failed",
+            )
+        )
 
         return result
 
-    # Run detective, mafia, and guardian simultaneously
     _, killed, protected = await asyncio.gather(
         _detective_action(),
         _mafia_action(),
         _guardian_action(),
     )
 
-    # === Resolve guardian protection before doctor sees the result ===
     if protected and killed == protected:
+        guardians = state.get_by_role("guardian")
+        guardian_name = guardians[0] if guardians else None
         killed = None
-        if event_bus:
-            await event_bus.emit_system_message(
-                f"Guardian saved {protected} from the mafia!"
+        if guardian_name:
+            bus.emit(
+                SystemMessage(
+                    channel=player_channel(guardian_name),
+                    text=t("guardian_saved", protected),
+                )
             )
 
     # === PHASE 2: Doctor acts after seeing the post-guardian result ===
@@ -650,7 +565,7 @@ async def night_phase(
     poisoned = None
     if doctors and (state.doctor_has_save or state.doctor_has_poison):
         doctor_name = doctors[0]
-        log_to_agent(agent_dirs[doctor_name], t("night_doctor_decision", round_id))
+        channel = player_channel(doctor_name)
 
         agent = agents[doctor_name]
         phase_label = (
@@ -672,9 +587,9 @@ async def night_phase(
             doctor_name,
             agent,
             prompt,
-            stream_callback=_make_dual_stream_single(
-                agent_dirs[doctor_name], doctor_name, event_bus
-            ),
+            bus=bus,
+            channel=channel,
+            context="night_action",
             response_format=DOCTOR_ACTION_SCHEMA,
         )
 
@@ -690,16 +605,21 @@ async def night_phase(
                 doctor_saved = True
                 state.doctor_has_save = False
                 notes_parts.append(t("used_save", killed) + "\n")
-                if event_bus:
-                    await event_bus.emit_night_action(
-                        "doctor", doctor_name, "save", killed, "saved"
+                bus.emit(
+                    NightAction(
+                        channel=channel,
+                        role="doctor",
+                        actor=doctor_name,
+                        action="save",
+                        target=killed,
+                        outcome="saved",
                     )
+                )
             elif parsed.get("save") and not state.doctor_has_save:
                 notes_parts.append(t("save_already_used") + "\n")
             elif parsed.get("save") and not killed:
                 notes_parts.append(t("save_no_target") + "\n")
 
-            # Handle poison
             poison_target = parsed.get("poison", "")
             if poison_target and state.doctor_has_poison:
                 valid_poison = [
@@ -709,10 +629,16 @@ async def night_phase(
                     poisoned = poison_target
                     state.doctor_has_poison = False
                     notes_parts.append(t("used_poison", poisoned) + "\n")
-                    if event_bus:
-                        await event_bus.emit_night_action(
-                            "doctor", doctor_name, "poison", poisoned, "poisoned"
+                    bus.emit(
+                        NightAction(
+                            channel=channel,
+                            role="doctor",
+                            actor=doctor_name,
+                            action="poison",
+                            target=poisoned,
+                            outcome="poisoned",
                         )
+                    )
                 else:
                     notes_parts.append(t("invalid_poison_target", poison_target) + "\n")
             elif poison_target and not state.doctor_has_poison:
@@ -727,12 +653,14 @@ async def night_phase(
         notes_path = data_dir / f"NIGHT_DOCTOR_NOTES_{round_id}.txt"
         notes_path.write_text("\n".join(notes_parts))
         _distribute_transcript(str(notes_path), agent_dirs, [doctor_name])
-        log_to_agent(agent_dirs[doctor_name], "\n".join(notes_parts).strip())
 
-    # If doctor saved the killed player, they survive
     if doctor_saved and killed:
-        if event_bus:
-            await event_bus.emit_system_message(f"Doctor saved {killed}!")
+        bus.emit(
+            SystemMessage(
+                channel=player_channel(doctor_name),
+                text=t("doctor_saved", killed),
+            )
+        )
         killed = None
 
     return killed, poisoned
@@ -746,9 +674,8 @@ async def day_phase(
     day_rounds: int,
     killed: str | None,
     poisoned: str | None,
-    session_name: str,
+    bus: EventBus,
     use_llm_consensus: bool = False,
-    event_bus: GameEventBus | None = None,
 ) -> tuple[str | None, list[str]]:
     """Run the day phase.
 
@@ -758,46 +685,26 @@ async def day_phase(
     data_dir = Path(state.data_dir)
     round_id = state.round_id
 
-    if event_bus:
-        await event_bus.emit_phase_change(
-            "day", round_id, sorted(state.alive), _get_dead_players(state), state.mayor
-        )
+    _emit_phase(bus, state, "day")
 
-    # Announce deaths
     deaths: list[str] = []
     if killed:
         deaths.append(t("killed_by_mafia", killed, role_name(state.roles[killed])))
         state.eliminate(killed, "killed by mafia")
-        mark_agent_dead(session_name, killed, agent_dirs[killed])
-        if event_bus:
-            await event_bus.emit_death(killed, "mafia_kill", state.roles[killed])
-        # Mayor succession if killed player was mayor
-        await _handle_mayor_succession(
-            state, agent_dirs, agents, killed, session_name, event_bus=event_bus
-        )
+        bus.emit(Death(player=killed, cause="mafia_kill", role=state.roles[killed]))
+        await _handle_mayor_succession(state, agents, killed, bus)
 
     if poisoned:
         deaths.append(t("killed_by_poison", poisoned, role_name(state.roles[poisoned])))
         state.eliminate(poisoned, "poisoned by doctor")
-        mark_agent_dead(session_name, poisoned, agent_dirs[poisoned])
-        if event_bus:
-            await event_bus.emit_death(poisoned, "poison", state.roles[poisoned])
-        # Mayor succession if poisoned player was mayor
-        await _handle_mayor_succession(
-            state, agent_dirs, agents, poisoned, session_name, event_bus=event_bus
-        )
+        bus.emit(Death(player=poisoned, cause="poison", role=state.roles[poisoned]))
+        await _handle_mayor_succession(state, agents, poisoned, bus)
 
     death_announcement = "\n".join(deaths) if deaths else t("no_deaths")
 
-    # Log to all alive agents
-    for name in state.alive:
-        log_to_agent(agent_dirs[name], t("day", round_id))
-        log_to_agent(agent_dirs[name], death_announcement)
+    if not deaths:
+        bus.emit(SystemMessage(text=t("no_deaths")))
 
-    if event_bus and not deaths:
-        await event_bus.emit_system_message(t("no_deaths"))
-
-    # Check win condition
     winner = state.check_win()
     if winner:
         return None, []
@@ -828,29 +735,21 @@ async def day_phase(
         transcript_path=transcript_path,
         max_rounds=day_rounds,
         meeting_context=meeting_context,
-        log_callback=_make_dual_log(agent_dirs, event_bus),
-        stream_callback=_make_dual_stream(agent_dirs, event_bus),
+        bus=bus,
+        meeting_channel="public",
         first_speaker=state.mayor,
         use_llm_consensus=use_llm_consensus,
     )
 
-    # Vote
-    for name in state.alive:
-        log_to_agent(agent_dirs[name], t("voting"))
+    bus.emit(SystemMessage(text=t("voting")))
 
     eliminated, vote_results = await run_vote(
         participants=alive_agents,
-        stream_callback=_make_dual_stream(agent_dirs, event_bus),
+        bus=bus,
+        channel="public",
         mayor=state.mayor,
     )
 
-    # Emit votes to web
-    if event_bus:
-        for voter, data in vote_results.items():
-            await event_bus.emit_vote(voter, data["vote"], data.get("reasoning", ""))
-        await event_bus.emit_vote_result("eliminate", eliminated)
-
-    # Append vote results to transcript (no reasoning, just votes + outcome)
     eliminated_role = state.roles[eliminated] if eliminated else None
     vote_lines = [f"\n{t('day_vote_header')}"]
     for voter, data in vote_results.items():
@@ -860,30 +759,16 @@ async def day_phase(
     with open(transcript_path, "a") as f:
         f.write("\n".join(vote_lines) + "\n")
 
-    # Include vote results in transcript lines for diary phase
     transcript_lines.extend(vote_lines)
 
-    # Distribute day transcript to all players (alive and dead can observe)
     _distribute_transcript(transcript_path, agent_dirs, state.players)
 
     if eliminated:
         state.eliminate(eliminated, "voted out")
-        mark_agent_dead(session_name, eliminated, agent_dirs[eliminated])
-        for name in state.alive:
-            log_to_agent(
-                agent_dirs[name],
-                t(
-                    "voted_out_announcement",
-                    eliminated,
-                    role_name(state.roles[eliminated]),
-                ),
-            )
-        if event_bus:
-            await event_bus.emit_death(eliminated, "voted_out", state.roles[eliminated])
-        # Mayor succession if voted-out player was mayor
-        await _handle_mayor_succession(
-            state, agent_dirs, agents, eliminated, session_name, event_bus=event_bus
+        bus.emit(
+            Death(player=eliminated, cause="voted_out", role=state.roles[eliminated])
         )
+        await _handle_mayor_succession(state, agents, eliminated, bus)
 
     return eliminated, transcript_lines
 
@@ -893,30 +778,19 @@ async def diary_phase(
     agent_dirs: dict[str, str],
     agents: dict[str, Agent],
     day_transcript_lines: list[str],
-    event_bus: GameEventBus | None = None,
+    bus: EventBus,
 ) -> None:
     """Have all agents (alive and dead) write diary and knowledge files."""
     round_id = state.round_id
     alive_sorted = sorted(state.alive)
 
-    if event_bus:
-        await event_bus.emit_phase_change(
-            "diary",
-            round_id,
-            sorted(state.alive),
-            _get_dead_players(state),
-            state.mayor,
-        )
+    _emit_phase(bus, state, "diary")
 
-    # Build the day transcript string
     day_transcript = (
         "\n".join(day_transcript_lines) if day_transcript_lines else t("no_day_meeting")
     )
 
     async def _write_diary(name: str) -> None:
-        log_to_agent(agent_dirs[name], t("writing_diary_round", round_id))
-
-        # Read night transcript for this player's role
         night_transcript = None
         role = state.roles.get(name)
         data_dir = Path(state.data_dir)
@@ -940,22 +814,23 @@ async def diary_phase(
         prompt = diary_prompt(
             name, round_id, alive_sorted, day_transcript, night_transcript
         )
-
-        def _stream(text: str, n: str = name) -> None:
-            stream_to_agent(agent_dirs[n], text)
-            if event_bus is not None:
-                asyncio.ensure_future(event_bus.emit_diary_chunk(n, text))
-
         text = await _get_agent_response(
             name,
             agents[name],
             prompt,
-            stream_callback=_stream,
+            bus=bus,
+            channel=player_channel(name),
+            context="diary",
         )
 
-        log_to_agent(agent_dirs[name], t("diary_written"))
-        if event_bus:
-            await event_bus.emit_diary_entry(name, text)
+        bus.emit(
+            DiaryEntry(
+                channel=player_channel(name),
+                name=name,
+                round_id=round_id,
+                text=text,
+            )
+        )
 
     eligible = [n for n in sorted(state.players) if n in agent_dirs and n in agents]
     await asyncio.gather(*(_write_diary(n) for n in eligible))
@@ -966,27 +841,16 @@ async def postgame_phase(
     agent_dirs: dict[str, str],
     agents: dict[str, Agent],
     winner: str,
-    event_bus: GameEventBus | None = None,
+    bus: EventBus,
 ) -> None:
     """Have all agents reflect on the completed game, update knowledge, and write lessons learned."""
-    logger.info(t("postgame_reflection"))
-
-    if event_bus:
-        await event_bus.emit_phase_change(
-            "postgame",
-            state.round_id,
-            sorted(state.alive),
-            _get_dead_players(state),
-            state.mayor,
-        )
+    _emit_phase(bus, state, "postgame")
 
     other_players = {
         name: [p for p in state.players if p != name] for name in state.players
     }
 
     async def _reflect(name: str) -> None:
-        log_to_agent(agent_dirs[name], t("postgame_reflection_agent"))
-
         prompt = postgame_prompt(
             agent_name=name,
             agent_role=state.roles[name],
@@ -997,21 +861,22 @@ async def postgame_phase(
             other_players=other_players[name],
         )
 
-        def _stream(text: str, n: str = name) -> None:
-            stream_to_agent(agent_dirs[n], text)
-            if event_bus is not None:
-                asyncio.ensure_future(event_bus.emit_diary_chunk(n, text))
-
         text = await _get_agent_response(
             name,
             agents[name],
             prompt,
-            stream_callback=_stream,
+            bus=bus,
+            channel=player_channel(name),
+            context="postgame",
         )
 
-        log_to_agent(agent_dirs[name], t("postgame_reflection_complete"))
-        if event_bus:
-            await event_bus.emit_diary_entry(name, text)
+        bus.emit(
+            PostgameReflection(
+                channel=player_channel(name),
+                name=name,
+                text=text,
+            )
+        )
 
     eligible = [n for n in sorted(state.players) if n in agent_dirs and n in agents]
     await asyncio.gather(*(_reflect(n) for n in eligible))

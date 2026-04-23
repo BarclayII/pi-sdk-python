@@ -23,8 +23,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pi_sdk import Agent
 
 from agent_factory import build_all_agents, build_facilitator
+from console_client import ConsoleClient
+from event_bus import EventBus
+from events import (
+    GameResult,
+    GameStart,
+    RoleAssigned,
+    RoundStart,
+    player_channel,
+)
 from game_state import GameState
-from i18n import role_name, set_lang, t, winner_label
+from i18n import set_lang
 from orchestrator import (
     day_phase,
     diary_phase,
@@ -33,7 +42,6 @@ from orchestrator import (
     night_phase,
     postgame_phase,
 )
-from tmux_utils import create_session, log_to_agent
 
 from loguru import logger
 
@@ -75,19 +83,9 @@ def parse_args() -> argparse.Namespace:
         help="Runtime data directory (default: ./data)",
     )
     parser.add_argument(
-        "--session-name",
-        default="mafia",
-        help="Tmux session name (default: mafia)",
-    )
-    parser.add_argument(
         "--facilitator-model",
         default=None,
         help="Model for facilitator agent (default: claude-sonnet-4-6)",
-    )
-    parser.add_argument(
-        "--no-tmux",
-        action="store_true",
-        help="Disable tmux session creation",
     )
     parser.add_argument(
         "--llm-consensus",
@@ -96,9 +94,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default="WARNING",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)",
+        help="Logging level for debug/warnings (default: WARNING)",
     )
     return parser.parse_args()
 
@@ -110,37 +108,25 @@ async def game_loop(
     facilitator,
     mafia_rounds: int,
     day_rounds: int,
-    session_name: str,
+    bus: EventBus,
     use_llm_consensus: bool = False,
 ) -> str:
     """Main game loop. Returns winner: 'village' or 'mafia'."""
 
     while True:
         state.round_id += 1
-        logger.info(t("round", state.round_id))
+        bus.emit(RoundStart(round_id=state.round_id))
 
-        for name in state.alive:
-            log_to_agent(agent_dirs[name], t("round", state.round_id))
-
-        # Night phase
-        logger.info(t("night", state.round_id))
         killed, poisoned = await night_phase(
             state,
             agent_dirs,
             agents,
             facilitator,
             mafia_rounds,
-            session_name,
+            bus,
             use_llm_consensus=use_llm_consensus,
         )
 
-        if killed:
-            logger.info(t("mafia_killed", killed))
-        if poisoned:
-            logger.info(t("doctor_poisoned", poisoned))
-
-        # Day phase
-        logger.info(t("day", state.round_id))
         eliminated, day_transcript_lines = await day_phase(
             state,
             agent_dirs,
@@ -149,43 +135,26 @@ async def game_loop(
             day_rounds,
             killed,
             poisoned,
-            session_name,
+            bus,
             use_llm_consensus=use_llm_consensus,
         )
 
-        if eliminated:
-            logger.info(t("voted_out", eliminated, role_name(state.roles[eliminated])))
-
-        # Check win condition
         winner = state.check_win()
         if winner:
             return winner
 
-        # Diary phase
-        logger.info(t("diary_phase"))
-        await diary_phase(state, agent_dirs, agents, day_transcript_lines)
-
-        logger.info(
-            t(
-                "alive",
-                ", ".join(
-                    f"{n} ({role_name(state.roles[n])})" for n in sorted(state.alive)
-                ),
-            ),
-        )
+        await diary_phase(state, agent_dirs, agents, day_transcript_lines, bus)
 
 
 async def main():
     load_dotenv()
     args = parse_args()
 
-    # Set language before anything else
     set_lang(args.lang)
 
     logger.remove()
     logger.add(sys.stderr, level=args.log_level)
 
-    # Validate agent directories
     agent_dirs: dict[str, str] = {}
     for d in args.agent_dirs:
         path = Path(d).resolve()
@@ -202,7 +171,7 @@ async def main():
         agent_dirs[name] = str(path)
 
     if len(agent_dirs) < 5:
-        logger.error(t("need_5_agents"))
+        logger.error("Need at least 5 agents to play Mafia.")
         sys.exit(1)
 
     # Create data directories for each agent and distribute RULES.md
@@ -212,85 +181,64 @@ async def main():
         data_path.mkdir(parents=True, exist_ok=True)
         shutil.copy2(rules_src, data_path / "RULES.md")
 
-    # Initialize game state
     state = GameState(
         players=list(agent_dirs.keys()),
         data_dir=str(Path(args.data_dir).resolve()),
     )
     state.assign_roles()
 
-    logger.info(t("mafia_game_title"))
-    logger.info(t("players", ", ".join(state.players)))
-    logger.info(
-        t(
-            "roles",
-            ", ".join(f"{n}: {role_name(r)}" for n, r in sorted(state.roles.items())),
-        ),
-    )
+    bus = EventBus()
+    bus.add_client(ConsoleClient())
+    await bus.start()
 
-    # Setup tmux
-    if not args.no_tmux:
-        create_session(args.session_name, agent_dirs)
-        logger.info(
-            "Tmux session '{}' created. Attach with: tmux attach -t {}",
-            args.session_name,
-            args.session_name,
+    try:
+        bus.emit(GameStart(players=list(state.players), roles=dict(state.roles)))
+        for name, role in sorted(state.roles.items()):
+            bus.emit(
+                RoleAssigned(
+                    channel=player_channel(name),
+                    player=name,
+                    role=role,
+                )
+            )
+
+        facilitator = build_facilitator(args.facilitator_model)
+        agents = build_all_agents(state, agent_dirs)
+
+        await mayor_election_phase(
+            state=state,
+            agent_dirs=agent_dirs,
+            agents=agents,
+            facilitator=facilitator,
+            mayor_rounds=args.mayor_rounds,
+            bus=bus,
+            use_llm_consensus=args.llm_consensus,
         )
 
-    # Log each player's assigned role to their activity.log
-    for name, agent_dir in agent_dirs.items():
-        role = state.roles[name]
-        log_to_agent(agent_dir, t("role_assigned", role_name(role)))
+        await mayor_election_diary_phase(state, agent_dirs, agents, bus)
 
-    # Build facilitator
-    facilitator = build_facilitator(args.facilitator_model)
-
-    # Build persistent agents (one per player, for the entire game)
-    agents = build_all_agents(state, agent_dirs)
-
-    # Day 0: Mayor election
-    await mayor_election_phase(
-        state=state,
-        agent_dirs=agent_dirs,
-        agents=agents,
-        facilitator=facilitator,
-        mayor_rounds=args.mayor_rounds,
-        session_name=args.session_name,
-        use_llm_consensus=args.llm_consensus,
-    )
-
-    # Day 0: Diary
-    logger.info(t("day0_diary_phase"))
-    await mayor_election_diary_phase(state, agent_dirs, agents)
-
-    # Run game
-    winner = await game_loop(
-        state=state,
-        agent_dirs=agent_dirs,
-        agents=agents,
-        facilitator=facilitator,
-        mafia_rounds=args.mafia_rounds,
-        day_rounds=args.day_rounds,
-        session_name=args.session_name,
-        use_llm_consensus=args.llm_consensus,
-    )
-
-    # Print results
-    logger.info(t("game_over"))
-    logger.info(t("winner", winner_label(winner)))
-    logger.info(t("final_roles"))
-    for name in state.players:
-        status = t("status_alive") if name in state.alive else t("status_dead")
-        logger.info("  {}: {} ({})", name, role_name(state.roles[name]), status)
-
-    for name in state.alive:
-        log_to_agent(
-            agent_dirs[name],
-            t("game_over_winner", winner_label(winner)),
+        winner = await game_loop(
+            state=state,
+            agent_dirs=agent_dirs,
+            agents=agents,
+            facilitator=facilitator,
+            mafia_rounds=args.mafia_rounds,
+            day_rounds=args.day_rounds,
+            bus=bus,
+            use_llm_consensus=args.llm_consensus,
         )
 
-    # Post-game reflection: agents summarize, update knowledge, and write lessons learned
-    await postgame_phase(state, agent_dirs, agents, winner)
+        bus.emit(
+            GameResult(
+                winner=winner,
+                final_roles=dict(state.roles),
+                alive=sorted(state.alive),
+            )
+        )
+
+        await postgame_phase(state, agent_dirs, agents, winner, bus)
+    finally:
+        await bus.stop()
 
 
 if __name__ == "__main__":
