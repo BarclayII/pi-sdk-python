@@ -8,6 +8,7 @@ the single-pane console readable.
 
 from __future__ import annotations
 
+import colorsys
 import hashlib
 
 from rich.console import Console
@@ -28,6 +29,7 @@ from events import (
     MayorElected,
     MayorTiebreak,
     NightAction,
+    NightActionStart,
     PhaseChange,
     PostgameReflection,
     RoleAssigned,
@@ -44,25 +46,33 @@ from events import (
 )
 
 
-# Colors for per-speaker styling. Stable per name via hashing.
 _PALETTE = [
-    "cyan",
-    "magenta",
-    "green",
-    "yellow",
-    "blue",
-    "bright_cyan",
-    "bright_magenta",
-    "bright_green",
-    "bright_yellow",
-    "bright_blue",
-    "red",
+    "red", "green", "yellow", "magenta", "cyan",
+    "medium_spring_green", "purple", "green_yellow",
+    "deep_pink1", "orange1", "cyan1", "red1", "yellow1",
+    "blue1", "magenta1", "green1",
 ]
+
+# First-seen name claims its hashed slot; later collisions linear-probe to the
+# next free slot. Assignments are cached so each name stays on one color for
+# the whole process.
+_color_assignments: dict[str, str] = {}
+_used_indices: set[int] = set()
 
 
 def _color_for(name: str) -> str:
-    digest = hashlib.md5(name.encode()).digest()[0]
-    return _PALETTE[digest % len(_PALETTE)]
+    cached = _color_assignments.get(name)
+    if cached is not None:
+        return cached
+    digest = hashlib.md5(name.encode()).digest()[:2]
+    index = int.from_bytes(digest, "big") % len(_PALETTE)
+    if len(_used_indices) < len(_PALETTE):
+        while index in _used_indices:
+            index = (index + 1) % len(_PALETTE)
+    _used_indices.add(index)
+    color = _PALETTE[index]
+    _color_assignments[name] = color
+    return color
 
 
 def _channel_tag(channel: str) -> str | None:
@@ -263,6 +273,15 @@ class ConsoleClient(Client):
             f"[dim]({e.via})[/dim]"
         )
 
+    def _on_NightActionStart(self, e: NightActionStart) -> None:
+        self._finish_stream()
+        prefix = self._print_channel_prefix(e.channel)
+        actor_color = _color_for(e.actor)
+        self.console.print(
+            f"{prefix}[bold]▸ {e.role.upper()} TURN[/bold] "
+            f"[{actor_color}]({e.actor})[/{actor_color}] [dim]deciding…[/dim]"
+        )
+
     def _on_NightAction(self, e: NightAction) -> None:
         self._finish_stream()
         prefix = self._print_channel_prefix(e.channel)
@@ -272,10 +291,13 @@ class ConsoleClient(Client):
             if e.target
             else "[dim]—[/dim]"
         )
+        reasoning = (
+            f"\n    [dim italic]↳ {e.reasoning}[/dim italic]" if e.reasoning else ""
+        )
         self.console.print(
             f"{prefix}[{actor_color}]{e.actor}[/{actor_color}] "
             f"[dim]({e.role})[/dim] {e.action} → {target} "
-            f"[bold]{e.outcome}[/bold]"
+            f"[bold]{e.outcome}[/bold]{reasoning}"
         )
 
     def _on_DiaryEntry(self, e: DiaryEntry) -> None:

@@ -133,7 +133,7 @@ async def _llm_single_response(
 def _extract_speak(text: str) -> str | None:
     """Extract content from <speak>...</speak> tags.
 
-    Returns the speech content, or None if no tags found (agent chose silence).
+    Returns the speech content, or None if no well-formed pair is found.
     """
     match = re.search(r"<speak>(.*?)</speak>", text, re.DOTALL)
     if match:
@@ -502,18 +502,46 @@ It's your turn to speak. Keep your response to 2-4 sentences."""
                 prompt = "It's your turn to speak. Keep your response to 2-4 sentences."
 
         agent = participants[speaker]
-        response = await _get_agent_response(
-            speaker,
-            agent,
-            prompt,
-            bus=bus,
-            channel=meeting_channel,
-            context="speech",
-        )
-        response = response.strip()
+        speech: str | None = None
+        current_prompt = prompt
+        for speak_attempt in range(4):
+            response = await _get_agent_response(
+                speaker,
+                agent,
+                current_prompt,
+                bus=bus,
+                channel=meeting_channel,
+                context="speech",
+            )
+            response = response.strip()
+            speech = _extract_speak(response)
+            if speech:
+                break
+            logger.warning(
+                "Round {} - {}: missing/malformed <speak> tag (attempt {}/4), retrying",
+                round_num + 1,
+                speaker,
+                speak_attempt + 1,
+            )
+            if get_lang() == "cn":
+                current_prompt = (
+                    f"{prompt}\n\n"
+                    f"重要：你必须将发言完整地包裹在 <speak>...</speak> 标签中。"
+                    f"请重新发言。"
+                )
+            else:
+                current_prompt = (
+                    f"{prompt}\n\n"
+                    f"IMPORTANT: You must wrap your speech in well-formed "
+                    f"<speak>...</speak> tags. Please respond again."
+                )
 
-        speech = _extract_speak(response)
         if not speech:
+            logger.error(
+                "Round {} - {}: failed to produce <speak> tag after 4 attempts",
+                round_num + 1,
+                speaker,
+            )
             if bus is not None:
                 bus.emit(
                     SilentTurn(

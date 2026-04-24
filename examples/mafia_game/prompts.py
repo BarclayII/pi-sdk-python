@@ -47,7 +47,7 @@ IMPORTANT: Keep your responses concise (no more than 3 sentences per speaking tu
 
 IMPORTANT: When speaking, voting, or answering questions, respond with plain text in your message. NEVER use bash commands (like echo) or write to files to deliver your answers.
 
-When speaking in meetings, wrap your public speech in <speak>...</speak> tags. Only the content inside these tags will be visible to other players. You may read files and think privately outside the tags. If you choose not to include a <speak> tag, you will remain silent this round."""
+When speaking in meetings, wrap your public speech in <speak>...</speak> tags. Only the content inside these tags will be visible to other players. You may read files and think privately outside the tags. You must include a <speak>...</speak> block on every speaking turn."""
 
 
 def _agent_system_prompt_cn(
@@ -78,7 +78,7 @@ def _agent_system_prompt_cn(
 
 重要：发言、投票或回答问题时，请直接在消息中使用纯文本回复。不要使用bash命令（如echo）或写入文件来回答。
 
-在会议中发言时，将你的公开发言包裹在 <speak>...</speak> 标签中。只有标签内的内容会被其他玩家看到。你可以在标签外阅读文件和私下思考。如果你选择不使用 <speak> 标签，你将在本轮保持沉默。"""
+在会议中发言时，将你的公开发言包裹在 <speak>...</speak> 标签中。只有标签内的内容会被其他玩家看到。你可以在标签外阅读文件和私下思考。每次轮到你发言时，都必须包含一个 <speak>...</speak> 块。"""
 
 
 def phase_context_prompt(

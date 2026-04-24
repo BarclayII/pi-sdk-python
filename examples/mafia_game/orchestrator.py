@@ -16,6 +16,7 @@ from events import (
     DiaryEntry,
     MayorElected,
     NightAction,
+    NightActionStart,
     PhaseChange,
     PostgameReflection,
     SystemMessage,
@@ -281,6 +282,7 @@ async def night_phase(
             return
         detective = detectives[0]
         channel = player_channel(detective)
+        bus.emit(NightActionStart(channel=channel, role="detective", actor=detective))
 
         agent = agents[detective]
         phase_label = (
@@ -299,8 +301,10 @@ async def night_phase(
         )
 
         investigated = None
-        if isinstance(parsed, dict) and "investigate" in parsed:
-            target = parsed["investigate"]
+        reasoning = ""
+        if isinstance(parsed, dict):
+            reasoning = parsed.get("reasoning", "")
+            target = parsed.get("investigate")
             if target in state.alive and target != detective:
                 investigated = target
 
@@ -319,6 +323,7 @@ async def night_phase(
                     action="investigate",
                     target=investigated,
                     outcome="mafia" if is_mafia else "not_mafia",
+                    reasoning=reasoning,
                 )
             )
         else:
@@ -331,6 +336,7 @@ async def night_phase(
                     action="investigate",
                     target=None,
                     outcome="failed",
+                    reasoning=reasoning,
                 )
             )
 
@@ -348,6 +354,13 @@ async def night_phase(
 
         if len(mafia_members) == 1:
             mafia_name = mafia_members[0]
+            bus.emit(
+                NightActionStart(
+                    channel=player_channel(mafia_name),
+                    role="mafia",
+                    actor=mafia_name,
+                )
+            )
             agent = agents[mafia_name]
             others = sorted(state.alive)
             others_str = ", ".join(others)
@@ -385,7 +398,9 @@ async def night_phase(
                 response_format=VOTE_SCHEMA,
             )
 
+            mafia_reasoning = ""
             if isinstance(parsed, dict) and "vote" in parsed:
+                mafia_reasoning = parsed.get("reasoning", "")
                 vote = parsed["vote"]
                 if vote == "abstain":
                     target = None
@@ -399,7 +414,9 @@ async def night_phase(
                 else:
                     f.write(t("decided_skip", mafia_name) + "\n")
         else:
+            mafia_reasoning = ""
             mafia_agents = {m: agents[m] for m in mafia_members}
+            bus.emit(NightActionStart(channel="mafia", role="mafia", actor="mafia"))
 
             phase_label = (
                 "夜晚 — 狼人会议" if get_lang() == "cn" else "Night — Mafia Meeting"
@@ -459,6 +476,7 @@ async def night_phase(
                 action="kill",
                 target=target,
                 outcome="targeted" if target else "no_kill",
+                reasoning=mafia_reasoning,
             )
         )
 
@@ -471,6 +489,9 @@ async def night_phase(
 
         guardian_name = guardians[0]
         channel = player_channel(guardian_name)
+        bus.emit(
+            NightActionStart(channel=channel, role="guardian", actor=guardian_name)
+        )
 
         agent = agents[guardian_name]
         phase_label = (
@@ -501,8 +522,10 @@ async def night_phase(
         )
         notes_parts = [notes_header]
         result = None
+        guardian_reasoning = ""
 
         if isinstance(parsed, dict) and parsed.get("protect"):
+            guardian_reasoning = parsed.get("reasoning", "")
             protect_target = parsed["protect"]
             valid_targets = [
                 p
@@ -517,9 +540,9 @@ async def night_phase(
                 notes_parts.append(t("invalid_protect_target", protect_target) + "\n")
                 state.guardian_last_protected = None
 
-            if parsed.get("reasoning"):
+            if guardian_reasoning:
                 reasoning_label = "理由" if get_lang() == "cn" else "Reasoning"
-                notes_parts.append(f"{reasoning_label}: {parsed['reasoning']}\n")
+                notes_parts.append(f"{reasoning_label}: {guardian_reasoning}\n")
         else:
             notes_parts.append(t("guardian_decision_failed") + "\n")
             state.guardian_last_protected = None
@@ -536,6 +559,7 @@ async def night_phase(
                 action="protect",
                 target=result,
                 outcome="protected" if result else "failed",
+                reasoning=guardian_reasoning,
             )
         )
 
@@ -566,6 +590,7 @@ async def night_phase(
     if doctors and (state.doctor_has_save or state.doctor_has_poison):
         doctor_name = doctors[0]
         channel = player_channel(doctor_name)
+        bus.emit(NightActionStart(channel=channel, role="doctor", actor=doctor_name))
 
         agent = agents[doctor_name]
         phase_label = (
@@ -600,7 +625,9 @@ async def night_phase(
         )
         notes_parts = [notes_header]
 
+        doctor_reasoning = ""
         if isinstance(parsed, dict):
+            doctor_reasoning = parsed.get("reasoning", "")
             if parsed.get("save") and state.doctor_has_save and killed:
                 doctor_saved = True
                 state.doctor_has_save = False
@@ -613,6 +640,7 @@ async def night_phase(
                         action="save",
                         target=killed,
                         outcome="saved",
+                        reasoning=doctor_reasoning,
                     )
                 )
             elif parsed.get("save") and not state.doctor_has_save:
@@ -637,6 +665,7 @@ async def night_phase(
                             action="poison",
                             target=poisoned,
                             outcome="poisoned",
+                            reasoning=doctor_reasoning,
                         )
                     )
                 else:
@@ -644,9 +673,9 @@ async def night_phase(
             elif poison_target and not state.doctor_has_poison:
                 notes_parts.append(t("poison_already_used") + "\n")
 
-            if parsed.get("reasoning"):
+            if doctor_reasoning:
                 reasoning_label = "理由" if get_lang() == "cn" else "Reasoning"
-                notes_parts.append(f"{reasoning_label}: {parsed['reasoning']}\n")
+                notes_parts.append(f"{reasoning_label}: {doctor_reasoning}\n")
         else:
             notes_parts.append(t("doctor_decision_failed") + "\n")
 

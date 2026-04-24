@@ -166,6 +166,17 @@ class MayorElected(Event):
 
 
 @dataclass(frozen=True, kw_only=True)
+class NightActionStart(Event):
+    """A role is beginning their night decision. Marks a sub-phase boundary.
+
+    Channel is ``player:<actor>`` (solo roles) or ``"mafia"`` (team meeting).
+    """
+
+    role: str  # "detective" | "guardian" | "doctor" | "mafia"
+    actor: str
+
+
+@dataclass(frozen=True, kw_only=True)
 class NightAction(Event):
     """Outcome of a night role's private action.
 
@@ -178,6 +189,7 @@ class NightAction(Event):
     target: str | None
     outcome: str  # "mafia" | "not_mafia" | "protected" | "saved" | "poisoned"
     # | "failed" | "no_kill" | "targeted"
+    reasoning: str = ""
 
 
 @dataclass(frozen=True, kw_only=True)
