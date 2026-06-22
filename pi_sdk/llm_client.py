@@ -13,7 +13,7 @@ from typing import Any, AsyncGenerator, Literal, Union
 import httpx
 import litellm
 
-AIHUBMIX_API_BASE = "https://aihubmix.com/api/v1"
+AIHUBMIX_API_BASE = "https://aihubmix.com/v1"
 
 from pi_sdk.agent_types import TextDelta
 from pi_sdk.types import (
@@ -60,7 +60,7 @@ class LLMClient:
         model_name = self.model.split("/", 1)[-1] if "/" in self.model else self.model
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                "https://aihubmix.com/api/v1/models",
+                "https://aihubmix.com/v1/models",
                 params={"model": model_name},
             )
         if response.status_code != 200:

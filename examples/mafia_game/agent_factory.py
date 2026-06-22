@@ -38,7 +38,7 @@ def build_agent_config(
     llm = LLMClient(
         model=f"openai/{model}",
         api_key=os.getenv("API_KEY"),
-        api_base=os.getenv("API_BASE", "https://aihubmix.com/api/v1"),
+        api_base=os.getenv("API_BASE", "https://aihubmix.com/v1"),
         max_tokens=2048,
     )
 
