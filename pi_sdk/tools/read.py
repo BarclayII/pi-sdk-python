@@ -6,11 +6,13 @@ This module provides the ReadTool which reads content from files.
 
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
+
+import magic
 
 from pi_sdk.tools.base import Tool, ToolParameter, ToolResult, ToolSchema
 from pi_sdk.tools.path_utils import resolve_to_cwd
 from pi_sdk.tools.truncate import truncate_head
+from pi_sdk.types import ImageContent, TextContent, VideoContent
 
 
 @dataclass
@@ -21,7 +23,7 @@ class ReadTool(Tool):
     description: str = (
         "Read the contents of a file. "
         "Optionally specify offset and limit to read a portion of the file. "
-        "Images are returned as base64 encoded data URLs."
+        "Images and videos are read as media so they can be viewed directly."
     )
     schema: ToolSchema = field(
         default_factory=lambda: ToolSchema(
@@ -47,17 +49,6 @@ class ReadTool(Tool):
         )
     )
     cwd: str = "."
-
-    # Image file extensions that should be returned as base64
-    IMAGE_EXTENSIONS = {
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".gif",
-        ".webp",
-        ".bmp",
-        ".svg",
-    }
 
     async def execute(
         self,
@@ -115,10 +106,12 @@ class ReadTool(Tool):
                     is_error=True,
                 )
 
-            # Check if it's an image file
-            ext = Path(resolved_path).suffix.lower()
-            if ext in self.IMAGE_EXTENSIONS:
-                return self._read_image(resolved_path, path)
+            # Detect the file type from its contents (not the extension)
+            mime_type = magic.from_file(resolved_path, mime=True)
+            if mime_type.startswith("image/"):
+                return self._read_image(resolved_path, path, mime_type)
+            if mime_type.startswith("video/"):
+                return self._read_video(resolved_path, path, mime_type)
 
             # Read text file
             with open(resolved_path, "r", encoding="utf-8") as f:
@@ -159,34 +152,42 @@ class ReadTool(Tool):
                 is_error=True,
             )
 
-    def _read_image(self, resolved_path: str, display_path: str) -> ToolResult:
-        """Read an image file and return as base64 data URL.
+    def _read_image(
+        self, resolved_path: str, display_path: str, mime_type: str
+    ) -> ToolResult:
+        """Read an image file and return it as viewable media.
 
         Args:
             resolved_path: Resolved path to the image
             display_path: Original path for display
+            mime_type: Detected MIME type (e.g. "image/png")
 
         Returns:
-            ToolResult with base64 encoded image
+            ToolResult whose content carries the image as a content block
         """
-        import base64
+        return ToolResult(
+            content=[
+                TextContent(text=f"Contents of {display_path} ({mime_type}):"),
+                ImageContent.from_path(resolved_path, mime_type=mime_type),
+            ]
+        )
 
-        # Get mime type from extension
-        ext = Path(resolved_path).suffix.lower()
-        mime_types = {
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-            ".bmp": "image/bmp",
-            ".svg": "image/svg+xml",
-        }
-        mime_type = mime_types.get(ext, "image/png")
+    def _read_video(
+        self, resolved_path: str, display_path: str, mime_type: str
+    ) -> ToolResult:
+        """Read a video file and return it as viewable media.
 
-        # Read and encode image
-        with open(resolved_path, "rb") as f:
-            image_data = base64.b64encode(f.read()).decode("ascii")
+        Args:
+            resolved_path: Resolved path to the video
+            display_path: Original path for display
+            mime_type: Detected MIME type (e.g. "video/mp4")
 
-        data_url = f"data:{mime_type};base64,{image_data}"
-        return ToolResult(content=data_url)
+        Returns:
+            ToolResult whose content carries the video as a content block
+        """
+        return ToolResult(
+            content=[
+                TextContent(text=f"Contents of {display_path} ({mime_type}):"),
+                VideoContent.from_path(resolved_path, mime_type=mime_type),
+            ]
+        )

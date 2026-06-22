@@ -23,12 +23,14 @@ from pi_sdk.skills import load_skills
 from pi_sdk.tools.base import Tool
 from pi_sdk.types import (
     AssistantMessage,
+    ContentBlock,
     Message,
     TextContent,
     ToolCallContent,
     ToolResultMessage,
     Usage,
     UserMessage,
+    summarize_content,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,8 +55,7 @@ def _format_messages_for_compact(messages: list[Message]) -> str:
     lines: list[str] = []
     for msg in messages:
         if isinstance(msg, UserMessage):
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            lines.append(f"USER: {content}")
+            lines.append(f"USER: {summarize_content(msg.content)}")
         elif isinstance(msg, AssistantMessage):
             text_parts = [b.text for b in msg.content if isinstance(b, TextContent)]
             if text_parts:
@@ -63,7 +64,8 @@ def _format_messages_for_compact(messages: list[Message]) -> str:
             _, args = tool_call_map.get(msg.tool_call_id, (msg.tool_name, {}))
             error_tag = " [ERROR]" if msg.is_error else ""
             lines.append(
-                f"TOOL({msg.tool_name}, {json.dumps(args)}):{error_tag} {msg.content}"
+                f"TOOL({msg.tool_name}, {json.dumps(args)}):{error_tag} "
+                f"{summarize_content(msg.content)}"
             )
 
     return "\n".join(lines)
@@ -98,7 +100,7 @@ class Agent:
 
     async def run(
         self,
-        user_input: str,
+        user_input: str | list[ContentBlock],
         response_format: dict | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         """Run the agent loop for a single user input.
@@ -108,7 +110,9 @@ class Agent:
         multi-round conversations.
 
         Args:
-            user_input: The user's message text.
+            user_input: The user's message. Either a plain string, or a list
+                of content blocks (e.g. TextContent + ImageContent /
+                VideoContent) for multimodal input.
             response_format: Optional structured output format
                 (e.g. {"type": "json_schema", "json_schema": {...}}).
 
@@ -117,7 +121,7 @@ class Agent:
         """
         yield AgentStart()
 
-        logger.info("User prompt:\n%s", user_input)
+        logger.info("User prompt:\n%s", summarize_content(user_input))
         self.messages.append(UserMessage(content=user_input))
 
         for turn in range(self.max_turns):
@@ -169,41 +173,39 @@ class Agent:
                         tool = t
                         break
 
+                # message_content may be a string or a list of content blocks
+                # (e.g. media returned by the read tool); the emitted event
+                # carries only a string summary for display.
                 if tool is None:
-                    result = ToolExecEnd(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        content=f"Error: Tool '{tool_call.name}' not found",
-                        is_error=True,
-                    )
+                    message_content = f"Error: Tool '{tool_call.name}' not found"
+                    is_error = True
                 else:
                     try:
                         tool_result = await tool.execute(
                             tool_call.id, tool_call.arguments
                         )
-                        result = ToolExecEnd(
-                            tool_call_id=tool_call.id,
-                            name=tool_call.name,
-                            content=tool_result.content,
-                            is_error=tool_result.is_error,
-                        )
+                        message_content = tool_result.content
+                        is_error = tool_result.is_error
                     except Exception as e:
-                        result = ToolExecEnd(
-                            tool_call_id=tool_call.id,
-                            name=tool_call.name,
-                            content=f"Error executing tool: {e!s}",
-                            is_error=True,
-                        )
+                        message_content = f"Error executing tool: {e!s}"
+                        is_error = True
+
+                result = ToolExecEnd(
+                    tool_call_id=tool_call.id,
+                    name=tool_call.name,
+                    content=summarize_content(message_content),
+                    is_error=is_error,
+                )
 
                 yield result
 
-                # Add tool result to messages
+                # Add tool result to messages (preserving structured content)
                 self.messages.append(
                     ToolResultMessage(
-                        tool_call_id=result.tool_call_id,
-                        tool_name=result.name,
-                        content=result.content,
-                        is_error=result.is_error,
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        content=message_content,
+                        is_error=is_error,
                     )
                 )
 

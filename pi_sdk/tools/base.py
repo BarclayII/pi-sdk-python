@@ -5,7 +5,9 @@ This module defines the Tool protocol and related classes used throughout the SD
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, Union, runtime_checkable
+
+from pi_sdk.types import ContentBlock
 
 
 @dataclass
@@ -37,9 +39,14 @@ class ToolParameter:
 
 @dataclass
 class ToolResult:
-    """Result of a tool execution."""
+    """Result of a tool execution.
 
-    content: str
+    ``content`` is usually a string, but may be a list of content blocks
+    (e.g. TextContent + ImageContent / VideoContent) for tools that return
+    media to the model.
+    """
+
+    content: Union[str, list[ContentBlock]]
     is_error: bool = False
 
 

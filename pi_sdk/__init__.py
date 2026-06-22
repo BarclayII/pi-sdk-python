@@ -15,6 +15,7 @@ from pi_sdk.types import (
     ToolResultMessage,
     Usage,
     UserMessage,
+    VideoContent,
 )
 
 # Public API - LLM Client
@@ -50,6 +51,7 @@ __all__ = [
     "Message",
     "TextContent",
     "ImageContent",
+    "VideoContent",
     "ThinkingContent",
     "ToolCallContent",
     "Usage",

@@ -27,6 +27,7 @@ from pi_sdk.types import (
     ToolResultMessage,
     Usage,
     UserMessage,
+    VideoContent,
 )
 
 
@@ -176,14 +177,14 @@ class LLMClient:
 
         return result
 
-    def _convert_user_message(self, msg: UserMessage) -> dict[str, Any]:
-        """Convert a UserMessage to LiteLLM format."""
-        if isinstance(msg.content, str):
-            return {"role": "user", "content": msg.content}
+    def _convert_content_blocks(self, blocks: list[Any]) -> list[dict[str, Any]]:
+        """Convert a list of content blocks to LiteLLM/OpenAI multimodal parts.
 
-        # Handle content blocks
+        Handles text, image (image_url), and video (video_url) blocks. Used
+        for both user messages and media-bearing tool results.
+        """
         content: list[dict[str, Any]] = []
-        for block in msg.content:
+        for block in blocks:
             if isinstance(block, TextContent):
                 content.append({"type": "text", "text": block.text})
             elif isinstance(block, ImageContent):
@@ -195,8 +196,23 @@ class LLMClient:
                         },
                     }
                 )
+            elif isinstance(block, VideoContent):
+                content.append(
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": f"data:{block.mime_type};base64,{block.data}"
+                        },
+                    }
+                )
+        return content
 
-        return {"role": "user", "content": content}
+    def _convert_user_message(self, msg: UserMessage) -> dict[str, Any]:
+        """Convert a UserMessage to LiteLLM format."""
+        if isinstance(msg.content, str):
+            return {"role": "user", "content": msg.content}
+
+        return {"role": "user", "content": self._convert_content_blocks(msg.content)}
 
     def _convert_assistant_message(self, msg: AssistantMessage) -> dict[str, Any]:
         """Convert an AssistantMessage to LiteLLM format."""
@@ -239,12 +255,21 @@ class LLMClient:
         return result
 
     def _convert_tool_result_message(self, msg: ToolResultMessage) -> dict[str, Any]:
-        """Convert a ToolResultMessage to LiteLLM format."""
+        """Convert a ToolResultMessage to LiteLLM format.
+
+        Media-bearing tool results (content is a list of blocks) are sent as
+        a multimodal tool message so the model can see returned images/videos.
+        """
+        content = (
+            msg.content
+            if isinstance(msg.content, str)
+            else self._convert_content_blocks(msg.content)
+        )
         return {
             "role": "tool",
             "tool_call_id": msg.tool_call_id,
             "name": msg.tool_name,
-            "content": msg.content,
+            "content": content,
         }
 
     def _convert_tool(self, tool: Any) -> dict[str, Any]:
